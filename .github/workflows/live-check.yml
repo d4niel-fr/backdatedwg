@@ -1,0 +1,42 @@
+name: Live site check
+on:
+  workflow_dispatch:
+    inputs:
+      url:
+        description: Site to test
+        default: https://backdatedwg.vercel.app/
+  deployment_status:
+jobs:
+  e2e:
+    if: github.event_name == 'workflow_dispatch' || (github.event.deployment_status.state == 'success' && github.event.deployment.environment == 'Production')
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install Playwright and ezdxf
+        run: |
+          npm install --no-save playwright@1.56.1
+          npx playwright install --with-deps chromium
+          pip install ezdxf
+      - name: Sample files
+        run: |
+          pip install -r requirements.txt
+          curl -fsSL -o Sample_2018.dwg https://raw.githubusercontent.com/LibreDWG/libredwg/0.13.3/test/test-data/example_2018.dwg
+          python -c "import sys; sys.path.insert(0, 'tests'); from pathlib import Path; from conftest import build_sample; build_sample(Path('Sample_2018.dxf'))"
+      - name: Convert on the live site
+        run: |
+          URL="${{ github.event.inputs.url || github.event.deployment_status.environment_url || github.event.deployment_status.target_url }}"
+          echo "Testing $URL"
+          cp .github/e2e/live.mjs live.mjs
+          node live.mjs "$URL" Sample_2018.dwg Sample_2018.dxf
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: screenshots
+          path: "*.png"
