@@ -1,0 +1,30 @@
+name: Docker image check
+# Builds the Docker image with the real ODA File Converter and converts a
+# real AutoCAD 2018-format DWG to DWG 2010 / DWG 2000 / DXF 2004 through the API.
+on:
+  workflow_dispatch:
+  push:
+    paths: ["Dockerfile", "app/**", ".github/workflows/docker-check.yml", ".github/e2e/server_check.py"]
+jobs:
+  docker:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: ODA downloads currently listed
+        run: |
+          curl -fsSL https://www.opendesign.com/guestfiles/oda_file_converter | grep -oE 'ODAFileConverter[A-Za-z0-9_.]*\.(deb|rpm|AppImage|dmg|msi|zip)' | sort -u || echo "page not readable"
+      - name: Build image (ODA required)
+        run: docker build --progress=plain --build-arg REQUIRE_ODA=1 -t backdate . 2>&1 | tee build.log | grep -E "ODA|WARNING|ERROR|Downloading" || true; test "${PIPESTATUS[0]}" -eq 0
+      - name: Start container
+        run: |
+          docker run -d --name backdate -p 8000:8000 backdate
+          for i in $(seq 1 60); do curl -fs localhost:8000/healthz && break; sleep 1; done
+          echo; docker exec backdate sh -c 'command -v ODAFileConverter; ls /usr/bin | grep -i oda'
+      - name: Convert a real DWG
+        run: |
+          curl -fsSL -o Sample_2018.dwg https://raw.githubusercontent.com/LibreDWG/libredwg/0.13.3/test/test-data/example_2018.dwg
+          python3 .github/e2e/server_check.py http://localhost:8000 Sample_2018.dwg
+      - name: Container logs
+        if: always()
+        run: docker logs backdate 2>&1 | tail -80

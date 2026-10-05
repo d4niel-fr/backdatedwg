@@ -26,7 +26,7 @@ jobs:
           pip install ezdxf
       - name: Sample files
         run: |
-          pip install -r requirements.txt
+          pip install -r requirements-dev.txt
           curl -fsSL -o Sample_2018.dwg https://raw.githubusercontent.com/LibreDWG/libredwg/0.13.3/test/test-data/example_2018.dwg
           python -c "import sys; sys.path.insert(0, 'tests'); from pathlib import Path; from conftest import build_sample; build_sample(Path('Sample_2018.dxf'))"
       - name: Convert on the live site

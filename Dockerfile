@@ -24,9 +24,11 @@ RUN apt-get update \
 # ── app ────────────────────────────────────────────────────────────────────
 FROM python:3.12-slim-bookworm
 
-# Check https://www.opendesign.com/guestfiles/oda_file_converter for the
-# current Linux (Qt6, x64) .deb and pass it with --build-arg ODA_DEB_URL=...
-ARG ODA_DEB_URL="https://www.opendesign.com/guestfiles/get?filename=ODAFileConverter_QT6_lnxX64_8.3dll_25.12.deb"
+# By default the build finds the current Linux (Qt6, x64) .deb on ODA's
+# download page, since ODA renames it with every release. Pin one with
+# --build-arg ODA_DEB_URL=..., or drop a .deb into vendor/.
+ARG ODA_DEB_URL=""
+ARG ODA_PAGE="https://www.opendesign.com/guestfiles/oda_file_converter"
 ARG REQUIRE_ODA=0
 
 ENV PYTHONUNBUFFERED=1 \
@@ -48,9 +50,15 @@ RUN apt-get update \
 COPY vendor/ /tmp/vendor/
 RUN set -eu; \
     deb="$(ls /tmp/vendor/*.deb 2>/dev/null | head -n 1 || true)"; \
-    if [ -z "$deb" ] && [ -n "$ODA_DEB_URL" ]; then \
-      if curl -fsSL "$ODA_DEB_URL" -o /tmp/oda.deb; then deb=/tmp/oda.deb; \
-      else echo "WARNING: couldn't download ODA File Converter from $ODA_DEB_URL"; fi; \
+    url="$ODA_DEB_URL"; \
+    if [ -z "$deb" ] && [ -z "$url" ]; then \
+      name="$(curl -fsSL "$ODA_PAGE" | grep -oE 'ODAFileConverter_QT6_lnxX64_[A-Za-z0-9._]+\.deb' | sort -u -t_ -k5,5V -k4,4V | tail -n 1 || true)"; \
+      [ -n "$name" ] && url="https://www.opendesign.com/guestfiles/get?filename=$name"; \
+    fi; \
+    if [ -z "$deb" ] && [ -n "$url" ]; then \
+      echo "Downloading ODA File Converter: $url"; \
+      if curl -fsSL "$url" -o /tmp/oda.deb; then deb=/tmp/oda.deb; \
+      else echo "WARNING: couldn't download ODA File Converter from $url"; fi; \
     fi; \
     if [ -n "$deb" ]; then \
       apt-get update && apt-get install -y --no-install-recommends "$deb" && rm -rf /var/lib/apt/lists/*; \

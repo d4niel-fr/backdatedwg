@@ -1,14 +1,15 @@
 # Vercel serves the static, in-browser build only (see vercel.json).
 # Hide the Python server so Vercel never tries to run it as a function.
-app/main.py
-app/jobs.py
-requirements.txt
-requirements-dev.txt
-pyproject.toml
-Dockerfile
-docker-compose.yml
-render.yaml
-tests/
-design/
-vendor/
-.github/
+# Patterns are anchored with "/" so they only match at the repo root
+# (an unanchored "vendor/" would also drop static/vendor/).
+/app/main.py
+/app/jobs.py
+/requirements.txt
+/requirements-dev.txt
+/pyproject.toml
+/Dockerfile
+/docker-compose.yml
+/render.yaml
+/tests/
+/design/
+/vendor/
