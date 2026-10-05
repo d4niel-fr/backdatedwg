@@ -6,7 +6,16 @@ Upload → Converting → Download, built from the design handoff in [`design/`]
 
 ## Run it
 
-> **Not on Vercel.** Vercel runs Python as short-lived serverless functions. Those cap request bodies at 4.5 MB, can't keep a conversion running between requests, and can't install ODA File Converter. This app needs a normal server that runs the Docker image: Render, Railway, Fly.io, Google Cloud Run or any VPS.
+### Vercel (static, converts in the browser)
+
+Import the repo on Vercel. `vercel.json` builds a static site (`scripts/build-static.sh` → `dist/`), with no Python server. With no API available, the page converts files **on the visitor's own device**:
+
+- **DWG → DXF:** LibreDWG compiled to WebAssembly.
+- **Older version:** the same Python code as the server's fallback engine (`app/browser.py`), running in Pyodide inside a Web Worker.
+
+Files are never uploaded, so there's no size cap from Vercel.
+
+What it can't do: **save as DWG**. Writing DWG needs ODA File Converter, which only runs on a server. On Vercel, files are saved as DXF in the chosen version, which every AutoCAD release opens directly. For DWG output, deploy the Docker image instead (below). The first conversion downloads about 30 MB of converter files, which the browser caches after that.
 
 ### Render (easiest)
 
@@ -45,6 +54,7 @@ To convert DWG files, install ODA File Converter (it's found on `PATH`, in its s
 | --- | --- | --- | --- | --- |
 | ODA File Converter (Docker image) | ✓ | ✓ | ✓ 2000–2018 | ✓ 2000–2018 |
 | LibreDWG + ezdxf only | ✓ (R13–2018) | ✓ | — | ✓ 2000–2018 |
+| In the browser (Vercel / any static host) | ✓ (R13–2018) | ✓ | — | ✓ 2000–2018 |
 | ezdxf only | — | ✓ | — | ✓ 2000–2018 |
 
 The UI reads `/api/config` and only offers what the server can actually do. For example, the DWG chip is disabled and explained when ODA isn't installed.
@@ -109,6 +119,10 @@ app/
   engines.py    ODA File Converter and LibreDWG wrappers
   report.py     inventories, diffing, report text
   versions.py   AutoCAD format versions and file detection
+  browser.py    entry point for in-browser conversion (Pyodide)
 static/         the front end (plain HTML/CSS/JS, no build step)
+  browser/      Web Worker for in-browser conversion
+  vendor/       Pyodide + LibreDWG WebAssembly (see vendor/README.md)
+scripts/        build-static.sh: the static build for Vercel
 design/         the original design handoff
 ```

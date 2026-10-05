@@ -19,6 +19,10 @@
     pollFailures: 0,
     uploadStarted: 0,
     showAllReport: false,
+    mode: "server", // "server" (API available) | "browser" (static hosting, convert locally)
+    worker: null,
+    blobUrls: [],
+    anim: null,
   };
 
   // ── helpers ─────────────────────────────────────────────────────────────
@@ -43,6 +47,43 @@
   function codeNum(code) {
     const m = /^AC(\d{4})$/.exec(code || "");
     return m ? Number(m[1]) : Infinity;
+  }
+
+  // AutoCAD format versions (mirrors app/versions.py).
+  const VERSIONS = {
+    AC1009: ["AutoCAD R11/R12", "R12"],
+    AC1012: ["AutoCAD R13", "R13"],
+    AC1014: ["AutoCAD R14", "R14"],
+    AC1015: ["AutoCAD 2000–2002", "2000"],
+    AC1018: ["AutoCAD 2004–2006", "2004"],
+    AC1021: ["AutoCAD 2007–2009", "2007"],
+    AC1024: ["AutoCAD 2010–2012", "2010"],
+    AC1027: ["AutoCAD 2013–2017", "2013"],
+    AC1032: ["AutoCAD 2018–2026", "2018+"],
+  };
+  const BROWSER_TARGETS = [
+    [2000, "AC1015"], [2004, "AC1018"], [2007, "AC1021"],
+    [2010, "AC1024"], [2013, "AC1027"], [2018, "AC1032"],
+  ].map(([year, code]) => ({ year, code, label: VERSIONS[code][0] }));
+
+  // Identify a DWG/DXF from its first bytes (mirrors app/versions.detect).
+  function detectHead(bytes, name) {
+    const ascii = (a, b) => String.fromCharCode(...bytes.subarray(a, b));
+    const info = (kind, code) => {
+      const v = VERSIONS[code];
+      return { kind, code: v ? code : null, label: v ? v[0] : "Unknown version", short: v ? v[1] : "?" };
+    };
+    if (/^AC\d{4}$/.test(ascii(0, 6))) return info("DWG", ascii(0, 6));
+    if (/^AC[12]\./.test(ascii(0, 4))) return info("DWG", null);
+    const text = new TextDecoder("latin1").decode(bytes);
+    if (text.startsWith("AutoCAD Binary DXF")) {
+      const m = /\$ACADVER[\s\S]{0,8}?(AC\d{4})/.exec(text);
+      return info("DXF", m ? m[1] : null);
+    }
+    const m = /\$ACADVER\s*\r?\n\s*1\s*\r?\n\s*(AC\d{4})/.exec(text);
+    if (m) return info("DXF", m[1]);
+    if (/\.dxf$/i.test(name) && /^\s*0\s*\r?\n\s*SECTION/m.test(text)) return info("DXF", "AC1009");
+    return null;
   }
 
   function show(step) {
@@ -118,7 +159,11 @@
     for (const input of document.querySelectorAll('#format-chips input')) input.checked = input.value === state.format;
     const fhint = $("format-hint");
     fhint.hidden = dwgOk;
-    fhint.textContent = dwgOk ? "" : "DWG output needs ODA File Converter on the server, so files are saved as DXF.";
+    fhint.textContent = dwgOk
+      ? ""
+      : state.mode === "browser"
+        ? "Saving as DWG needs the server version of this app. DXF opens directly in any AutoCAD."
+        : "DWG output needs ODA File Converter on the server, so files are saved as DXF.";
 
     $("convert-btn").textContent = `Convert to ${state.target}`;
   }
@@ -172,9 +217,12 @@
       return setDropError("That file is empty.");
     }
     try {
-      const form = new FormData();
-      form.append("file", file.slice(0, 64 * 1024), file.name);
-      const info = await api("/api/detect", { method: "POST", body: form });
+      const head = new Uint8Array(await file.slice(0, 64 * 1024).arrayBuffer());
+      const info = detectHead(head, file.name);
+      if (!info) {
+        renderPicked();
+        return setDropError("This doesn't look like a DWG or DXF file.", "Unsupported file type");
+      }
       if (info.kind === "DWG" && !state.config.canReadDwg) {
         renderPicked();
         return setDropError("This server can't read DWG files yet. Upload a DXF instead.", "DWG not available");
@@ -187,7 +235,7 @@
       state.info = info;
     } catch (err) {
       renderPicked();
-      return setDropError(err.status ? err.message : "Couldn't reach the server. Check your connection and try again.");
+      return setDropError(`Couldn't read that file (${err.message}).`);
     }
     renderPicked();
     $("convert-btn").focus();
@@ -246,7 +294,9 @@
     const n = job && job.layersAndBlocks;
     const skipped = job ? job.skippedSoFar : 0;
     return [
-      current > 0 ? "Uploaded" : "Uploading file",
+      state.mode === "browser"
+        ? current > 0 ? "Converter ready" : "Loading converter (first time only)"
+        : current > 0 ? "Uploaded" : "Uploading file",
       "Reading file structure",
       n != null ? `Converting ${n.toLocaleString()} layers and blocks` : "Converting layers and blocks",
       `Writing ${state.target} file` + (skipped ? ` · ${plural(skipped, "item")} skipped so far` : ""),
@@ -299,6 +349,7 @@
 
   function startConversion() {
     if (!state.file || !state.info) return;
+    if (state.mode === "browser") return startInBrowser();
     setDropError(null);
     state.job = null;
     state.pollFailures = 0;
@@ -387,8 +438,94 @@
     }, POLL_MS);
   }
 
+  // ── in-browser conversion (static hosting, e.g. Vercel) ──────────────────
+  function startInBrowser() {
+    setDropError(null);
+    state.job = {
+      id: null,
+      file: { name: state.file.name, size: state.file.size, ...state.info },
+      target: { year: state.target },
+      format: "DXF",
+      layersAndBlocks: null,
+      skippedSoFar: 0,
+    };
+    renderConvertingHeader();
+    renderSteps(0, state.job);
+    setProgress(0, "Loading the converter…");
+    show("converting");
+    $("cancel-btn").focus();
+
+    if (!state.worker) {
+      state.worker = new Worker("browser/worker.js", { type: "module" });
+    }
+    const worker = state.worker;
+    const job = state.job;
+    const started = performance.now();
+    let stage = { index: 0, lo: 0, hi: 0, expected: 1, at: started };
+    let loadPct = 0;
+
+    const tick = () => {
+      if (state.step !== "converting" || state.job !== job) return;
+      let pct;
+      if (stage.index === 0) {
+        // Loading happens in a few big steps; creep between them so the bar keeps moving.
+        const creep = 90 * (1 - Math.exp(-(performance.now() - started) / 8000));
+        pct = (Math.max(loadPct, creep) / 100) * UPLOAD_SHARE;
+      } else {
+        const t = (performance.now() - stage.at) / 1000;
+        const inner = stage.lo + (stage.hi - stage.lo) * 0.95 * (1 - Math.exp(-t / stage.expected));
+        pct = UPLOAD_SHARE + (inner * (100 - UPLOAD_SHARE)) / 100;
+      }
+      const elapsed = (performance.now() - started) / 1000;
+      const eta = stage.index === 0 ? "Loading the converter…" : pct > 25 ? formatEta((elapsed * (100 - pct)) / pct) : "Working…";
+      setProgress(pct, eta);
+    };
+    clearInterval(state.anim);
+    state.anim = setInterval(tick, 250);
+
+    worker.onmessage = (e) => {
+      const msg = e.data;
+      if (state.job !== job) return;
+      if (msg.type === "load") {
+        loadPct = msg.pct;
+      } else if (msg.type === "py") {
+        if (msg.kind === "stage") {
+          stage = { ...msg.value, at: performance.now() };
+          renderSteps(stage.index, job);
+        } else if (msg.kind === "layers") {
+          job.layersAndBlocks = msg.value;
+          renderSteps(stage.index, job);
+        } else if (msg.kind === "skipped") {
+          job.skippedSoFar = msg.value;
+          renderSteps(stage.index, job);
+        }
+      } else if (msg.type === "done") {
+        clearInterval(state.anim);
+        const out = new Blob([msg.output], { type: "application/dxf" });
+        const txt = new Blob([msg.result.reportText], { type: "text/plain" });
+        const result = { ...msg.result, downloadUrl: URL.createObjectURL(out), reportUrl: URL.createObjectURL(txt) };
+        state.blobUrls.push(result.downloadUrl, result.reportUrl);
+        finish({ ...job, status: "done", result });
+      } else if (msg.type === "error") {
+        fail(msg.error.message, errorTag(msg.error.code));
+      }
+    };
+    worker.onerror = (e) => {
+      e.preventDefault();
+      state.worker = null;
+      worker.terminate();
+      fail("The in-browser converter couldn't start. Try a recent version of Chrome, Edge, Firefox or Safari.");
+    };
+
+    state.file.arrayBuffer().then(
+      (buffer) => worker.postMessage({ buffer, name: state.file.name, target: state.target }, [buffer]),
+      () => fail("Couldn't read that file from your device."),
+    );
+  }
+
   function stopWork() {
     clearTimeout(state.pollTimer);
+    clearInterval(state.anim);
     if (state.xhr) {
       state.xhr.abort();
       state.xhr = null;
@@ -397,6 +534,11 @@
 
   function cancel() {
     stopWork();
+    if (state.mode === "browser" && state.worker) {
+      // Stop the conversion mid-flight; the next one starts a fresh worker.
+      state.worker.terminate();
+      state.worker = null;
+    }
     if (state.job && state.job.id) {
       // Fire and forget: the server stops the job and deletes the files.
       fetch(`/api/jobs/${state.job.id}`, { method: "DELETE" }).catch(() => {});
@@ -433,8 +575,9 @@
     dl.textContent = `Download ${job.format}`;
     $("report-dl").href = r.reportUrl;
     const minutes = state.config.retentionMinutes;
-    $("expiry-note").textContent =
-      minutes >= 60 && minutes % 60 === 0
+    $("expiry-note").textContent = state.mode === "browser"
+      ? "Converted on your device. Your file was never uploaded."
+      : minutes >= 60 && minutes % 60 === 0
         ? `Files are deleted after ${plural(minutes / 60, "hour")}.`
         : `Files are deleted after ${plural(minutes, "minute")}.`;
     state.showAllReport = false;
@@ -500,6 +643,8 @@
     wireUpload();
     $("cancel-btn").addEventListener("click", cancel);
     $("again-btn").addEventListener("click", () => {
+      for (const url of state.blobUrls) URL.revokeObjectURL(url);
+      state.blobUrls = [];
       state.file = null;
       state.info = null;
       state.job = null;
@@ -515,9 +660,17 @@
     try {
       state.config = await api("/api/config");
     } catch {
-      state.config = { targets: [], formats: [], maxUploadMB: 200, retentionMinutes: 60, canReadDwg: false, defaultTarget: 2010 };
-      setDropError("Couldn't reach the conversion server. Refresh the page to try again.", "Server offline");
-      $("choose-btn").disabled = true;
+      // No conversion server (e.g. static hosting on Vercel): convert in the browser.
+      state.mode = "browser";
+      state.config = {
+        targets: BROWSER_TARGETS,
+        formats: ["DXF"],
+        maxUploadMB: 200,
+        retentionMinutes: 0,
+        canReadDwg: typeof WebAssembly === "object",
+        defaultTarget: 2010,
+      };
+      $("free-tag").textContent = "Free · files stay on your device";
     }
     state.target = state.config.defaultTarget;
     $("drop-hint").textContent = `.dwg or .dxf, up to ${state.config.maxUploadMB} MB`;
