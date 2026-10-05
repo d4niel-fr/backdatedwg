@@ -1,0 +1,14 @@
+# One-click deploy on Render: New + > Blueprint > pick this repo.
+# Runs the Dockerfile (app + ODA File Converter + LibreDWG).
+services:
+  - type: web
+    name: backdate-dwg
+    runtime: docker
+    plan: free
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /healthz
+    envVars:
+      - key: BACKDATE_MAX_UPLOAD_MB
+        value: "200"
+      - key: BACKDATE_WORKERS
+        value: "1"

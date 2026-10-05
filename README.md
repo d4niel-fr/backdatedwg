@@ -6,6 +6,12 @@ Upload → Converting → Download, built from the design handoff in [`design/`]
 
 ## Run it
 
+> **Not on Vercel.** Vercel runs Python as short-lived serverless functions. Those cap request bodies at 4.5 MB, can't keep a conversion running between requests, and can't install ODA File Converter. This app needs a normal server that runs the Docker image: Render, Railway, Fly.io, Google Cloud Run or any VPS.
+
+### Render (easiest)
+
+On [render.com](https://render.com) choose **New + → Blueprint** and pick this repo. It uses `render.yaml` and builds the Dockerfile. The first build takes a few minutes because it compiles LibreDWG.
+
 ### Docker (recommended: includes the DWG engines)
 
 ```bash
