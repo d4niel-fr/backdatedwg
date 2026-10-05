@@ -10,4 +10,10 @@ cp -R static/. dist/
 for f in __init__ versions report engines converter browser; do
   cp "app/$f.py" "dist/py/app/$f.py"
 done
+# The DWG converter runs as a separate server (the Docker image, e.g. on
+# Render); the page sends jobs there and falls back to in-browser DXF
+# conversion while it's unreachable.
+api="${BACKDATE_API_URL-https://backdate-dwg.onrender.com}"
+printf 'window.BACKDATE_API = "%s";\n' "$api" > dist/config.js
+echo "Conversion server: ${api:-none (in-browser only)}"
 echo "Built dist/ ($(du -sh dist | cut -f1))"

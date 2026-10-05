@@ -45,6 +45,8 @@ RUN apt-get update \
       libxkbcommon0 libxkbcommon-x11-0 libxcb-cursor0 libxcb-icccm4 libxcb-image0 \
       libxcb-keysyms1 libxcb-randr0 libxcb-render-util0 libxcb-shape0 libxcb-xinerama0 \
       libxcb-xkb1 libxrender1 libxi6 libsm6 libice6 \
+      libopengl0 libglx0 libx11-6 libx11-xcb1 libxcb1 libxcb-util1 libxcb-xfixes0 \
+      libxcb-sync1 libxcb-shm0 libxcb-render0 libxcb-glx0 libxext6 libxau6 libxdmcp6 \
  && rm -rf /var/lib/apt/lists/*
 
 COPY vendor/ /tmp/vendor/
@@ -66,6 +68,11 @@ RUN set -eu; \
     rm -rf /tmp/vendor /tmp/oda.deb; \
     if command -v ODAFileConverter >/dev/null || ls /usr/bin/ODAFileConverter* /opt/ODAFileConverter* >/dev/null 2>&1; then \
       echo "ODA File Converter installed"; \
+      for d in /usr/bin/ODAFileConverter_* /opt/ODAFileConverter*; do \
+        [ -d "$d" ] || continue; \
+        missing="$(find "$d" -type f \( -name '*.so*' -o -name ODAFileConverter \) -exec env LD_LIBRARY_PATH="$d" ldd {} \; 2>/dev/null | grep 'not found' | sort -u || true)"; \
+        if [ -n "$missing" ]; then echo "ODA missing libraries:"; echo "$missing"; fi; \
+      done; \
     elif [ "$REQUIRE_ODA" = "1" ]; then \
       echo "ERROR: ODA File Converter is required (REQUIRE_ODA=1) but isn't installed"; exit 1; \
     else \

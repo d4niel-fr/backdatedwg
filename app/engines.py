@@ -24,7 +24,9 @@ from typing import Optional
 
 
 class EngineError(RuntimeError):
-    pass
+    def __init__(self, message: str, broken: bool = False):
+        super().__init__(message)
+        self.broken = broken  # the engine itself is unusable, not the file
 
 
 class Cancelled(Exception):
@@ -165,6 +167,8 @@ class Oda:
             log += [ln.strip() for ln in err.read_text("utf-8", "replace").splitlines() if ln.strip()]
         # The Linux build often exits with a crash *after* writing a good file,
         # so success is judged by the output file, not the exit code.
+        if "error while loading shared libraries" in output:
+            raise EngineError(f"ODA File Converter isn't installed correctly on the server ({output.strip()[-200:]}).", broken=True)
         if not produced or produced[0].stat().st_size == 0:
             detail = "; ".join(log[-3:]) or output.strip()[-300:] or f"exit code {code}"
             raise EngineError(f"ODA File Converter could not convert the file ({detail}).")

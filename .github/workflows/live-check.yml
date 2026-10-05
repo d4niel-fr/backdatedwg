@@ -31,7 +31,8 @@ jobs:
           python -c "import sys; sys.path.insert(0, 'tests'); from pathlib import Path; from conftest import build_sample; build_sample(Path('Sample_2018.dxf'))"
       - name: Convert on the live site
         run: |
-          URL="${{ github.event.inputs.url || github.event.deployment_status.environment_url || github.event.deployment_status.target_url }}"
+          # Per-deployment URLs are behind Vercel login; test the public address.
+          URL="${{ github.event.inputs.url || 'https://backdatedwg.vercel.app/' }}"
           echo "Testing $URL"
           cp .github/e2e/live.mjs live.mjs
           node live.mjs "$URL" Sample_2018.dwg Sample_2018.dxf

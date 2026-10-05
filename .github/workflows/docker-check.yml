@@ -15,12 +15,14 @@ jobs:
         run: |
           curl -fsSL https://www.opendesign.com/guestfiles/oda_file_converter | grep -oE 'ODAFileConverter[A-Za-z0-9_.]*\.(deb|rpm|AppImage|dmg|msi|zip)' | sort -u || echo "page not readable"
       - name: Build image (ODA required)
-        run: docker build --progress=plain --build-arg REQUIRE_ODA=1 -t backdate . 2>&1 | tee build.log | grep -E "ODA|WARNING|ERROR|Downloading" || true; test "${PIPESTATUS[0]}" -eq 0
+        run: docker build --progress=plain --build-arg REQUIRE_ODA=1 -t backdate . 2>&1 | tee build.log | grep -E "ODA|WARNING|ERROR|Downloading|not found" || true; test "${PIPESTATUS[0]}" -eq 0
       - name: Start container
         run: |
           docker run -d --name backdate -p 8000:8000 backdate
           for i in $(seq 1 60); do curl -fs localhost:8000/healthz && break; sleep 1; done
-          echo; docker exec backdate sh -c 'command -v ODAFileConverter; ls /usr/bin | grep -i oda'
+          echo; docker exec backdate sh -c 'command -v ODAFileConverter; ls /usr/bin | grep -i oda; cat /usr/bin/ODAFileConverter | head -20'
+          echo "--- missing libraries (should be empty):"
+          docker exec backdate sh -c 'for d in /usr/bin/ODAFileConverter_*; do find "$d" -type f \( -name "*.so*" -o -name ODAFileConverter \) -exec env LD_LIBRARY_PATH="$d" ldd {} \; 2>/dev/null | grep "not found" | sort -u; done' || true
       - name: Convert a real DWG
         run: |
           curl -fsSL -o Sample_2018.dwg https://raw.githubusercontent.com/LibreDWG/libredwg/0.13.3/test/test-data/example_2018.dwg

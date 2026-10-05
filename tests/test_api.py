@@ -200,3 +200,13 @@ def test_real_dwg_when_available(client):
     job = wait(client, upload(client, Path(path), target=2004).json()["id"])
     assert job["status"] == "done", job
     assert job["result"]["outputName"].endswith("_2004.dxf")
+
+
+def test_cors_allows_static_frontend(client):
+    r = client.get("/api/config", headers={"Origin": "https://backdatedwg.vercel.app"})
+    assert r.headers["access-control-allow-origin"] in ("*", "https://backdatedwg.vercel.app")
+    pre = client.options(
+        "/api/jobs/abc",
+        headers={"Origin": "https://backdatedwg.vercel.app", "Access-Control-Request-Method": "DELETE"},
+    )
+    assert pre.status_code == 200

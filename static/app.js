@@ -5,6 +5,10 @@
   const $ = (id) => document.getElementById(id);
   const UPLOAD_SHARE = 20; // % of the bar used by the upload itself
   const POLL_MS = 500;
+  // Where the conversion server lives. Empty = same origin (Docker deploy).
+  // The static (Vercel) build sets it in config.js to a separately hosted server.
+  const API = String(window.BACKDATE_API || "").replace(/\/+$/, "");
+  const SERVER_WAIT_MS = 4 * 60 * 1000; // free hosts can take a minute or two to wake up
 
   const state = {
     config: null,
@@ -23,6 +27,7 @@
     worker: null,
     blobUrls: [],
     anim: null,
+    serverWaking: false,
   };
 
   // ── helpers ─────────────────────────────────────────────────────────────
@@ -94,7 +99,7 @@
   }
 
   async function api(path, options = {}) {
-    const res = await fetch(path, options);
+    const res = await fetch(API + path, options);
     let body = null;
     if (res.status !== 204) {
       try {
@@ -161,8 +166,10 @@
     fhint.hidden = dwgOk;
     fhint.textContent = dwgOk
       ? ""
-      : state.mode === "browser"
-        ? "Saving as DWG needs the server version of this app. DXF opens directly in any AutoCAD."
+      : state.mode === "browser" && state.serverWaking
+        ? "Waking up the DWG converter… this takes up to a minute. You can convert to DXF right away."
+        : state.mode === "browser"
+        ? "The DWG converter isn't reachable right now, so files are saved as DXF, which opens in any AutoCAD."
         : "DWG output needs ODA File Converter on the server, so files are saved as DXF.";
 
     $("convert-btn").textContent = `Convert to ${state.target}`;
@@ -367,7 +374,7 @@
     const xhr = new XMLHttpRequest();
     state.xhr = xhr;
     state.uploadStarted = performance.now();
-    xhr.open("POST", "/api/jobs");
+    xhr.open("POST", API + "/api/jobs");
     xhr.responseType = "json";
     xhr.upload.addEventListener("progress", (e) => {
       if (!e.lengthComputable) return;
@@ -541,7 +548,7 @@
     }
     if (state.job && state.job.id) {
       // Fire and forget: the server stops the job and deletes the files.
-      fetch(`/api/jobs/${state.job.id}`, { method: "DELETE" }).catch(() => {});
+      fetch(`${API}/api/jobs/${state.job.id}`, { method: "DELETE" }).catch(() => {});
     }
     state.job = null;
     backToUpload();
@@ -570,10 +577,10 @@
     $("done-title").textContent = `Your ${job.target.year} file is ready.`;
     $("done-meta").textContent = `${r.outputName} · ${job.file.short} → ${job.target.year} · ${formatSize(r.outputSize)}`;
     const dl = $("download-btn");
-    dl.href = r.downloadUrl;
+    dl.href = r.downloadUrl.startsWith("blob:") ? r.downloadUrl : API + r.downloadUrl;
     dl.setAttribute("download", r.outputName);
     dl.textContent = `Download ${job.format}`;
-    $("report-dl").href = r.reportUrl;
+    $("report-dl").href = r.reportUrl.startsWith("blob:") ? r.reportUrl : API + r.reportUrl;
     const minutes = state.config.retentionMinutes;
     $("expiry-note").textContent = state.mode === "browser"
       ? "Converted on your device. Your file was never uploaded."
@@ -658,23 +665,68 @@
     });
 
     try {
-      state.config = await api("/api/config");
+      state.config = await fetchConfig(API ? 8000 : 4000);
     } catch {
-      // No conversion server (e.g. static hosting on Vercel): convert in the browser.
-      state.mode = "browser";
-      state.config = {
-        targets: BROWSER_TARGETS,
-        formats: ["DXF"],
-        maxUploadMB: 200,
-        retentionMinutes: 0,
-        canReadDwg: typeof WebAssembly === "object",
-        defaultTarget: 2010,
-      };
-      $("free-tag").textContent = "Free · files stay on your device";
+      // No conversion server reachable (yet): convert in the browser for now.
+      useBrowserMode();
+      // A separately hosted server may just be asleep: keep trying, and switch
+      // to it (with DWG output) as soon as it answers.
+      if (API) waitForServer();
     }
     state.target = state.config.defaultTarget;
     $("drop-hint").textContent = `.dwg or .dxf, up to ${state.config.maxUploadMB} MB`;
     renderPicked();
+  }
+
+  async function fetchConfig(timeoutMs) {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+    try {
+      const cfg = await api("/api/config", { signal: ctrl.signal });
+      if (!cfg || !Array.isArray(cfg.targets)) throw new Error("not a Backdate server");
+      return cfg;
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  function useBrowserMode() {
+    state.mode = "browser";
+    state.config = {
+      targets: BROWSER_TARGETS,
+      formats: ["DXF"],
+      maxUploadMB: 200,
+      retentionMinutes: 0,
+      canReadDwg: typeof WebAssembly === "object",
+      defaultTarget: 2010,
+    };
+    state.serverWaking = !!API;
+    $("free-tag").textContent = "Free · no sign-up";
+  }
+
+  async function waitForServer() {
+    const until = Date.now() + SERVER_WAIT_MS;
+    while (Date.now() < until) {
+      try {
+        const cfg = await fetchConfig(20000);
+        if (state.step === "converting") {
+          // Don't switch engines mid-conversion; try again shortly.
+          await new Promise((r) => setTimeout(r, 3000));
+          continue;
+        }
+        state.mode = "server";
+        state.serverWaking = false;
+        state.config = cfg;
+        if (cfg.formats.includes("DWG")) state.format = "DWG";
+        $("drop-hint").textContent = `.dwg or .dxf, up to ${cfg.maxUploadMB} MB`;
+        if (state.step === "upload" || state.step === "error") renderPicked();
+        return;
+      } catch {
+        await new Promise((r) => setTimeout(r, 5000));
+      }
+    }
+    state.serverWaking = false;
+    if (state.step === "upload" || state.step === "error") syncOptions();
   }
 
   boot();

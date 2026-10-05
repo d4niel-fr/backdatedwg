@@ -149,6 +149,8 @@ def _load(src: Path, det: Detected, engines: Engines, work: Path, cancel: Cancel
         try:
             path, _ = engines.oda.convert(src, work, ver, "DXF", cancel, audit=True)
         except EngineError as e:
+            if e.broken:
+                raise ConversionError("engine_failed", str(e)) from e
             raise ConversionError("corrupt", f"The DWG file couldn't be read. It may be damaged. ({e})") from e
     elif engines.libredwg:
         path = work / (src.stem + ".dxf")

@@ -11,6 +11,7 @@ from pathlib import Path
 from urllib.parse import quote
 
 from fastapi import FastAPI, File, Form, Request, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -38,6 +39,14 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="Backdate.dwg", lifespan=lifespan)
+# The static front end (e.g. on Vercel) may call this API from another origin.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[o.strip() for o in os.environ.get("BACKDATE_CORS_ORIGINS", "*").split(",") if o.strip()],
+    allow_methods=["GET", "POST", "DELETE"],
+    allow_headers=["*"],
+    expose_headers=["Content-Disposition"],
+)
 
 
 def error(status: int, code: str, message: str) -> JSONResponse:
