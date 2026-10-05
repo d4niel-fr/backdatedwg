@@ -1,0 +1,9 @@
+[project]
+name = "backdate-dwg"
+version = "1.0.0"
+description = "Convert AutoCAD DWG/DXF files to older versions, with a report of anything skipped."
+requires-python = ">=3.10"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+filterwarnings = ["ignore::DeprecationWarning"]

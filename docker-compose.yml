@@ -1,0 +1,9 @@
+services:
+  backdate:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      BACKDATE_MAX_UPLOAD_MB: "200"
+      BACKDATE_RETENTION_SECONDS: "3600"
+    restart: unless-stopped

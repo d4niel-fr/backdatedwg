@@ -1,0 +1,138 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Backdate.dwg</title>
+<meta name="description" content="Save AutoCAD DWG and DXF files as an older release. Anything that can't be converted is skipped and listed in a report.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Ccircle cx='16' cy='16' r='16' fill='%23c67139'/%3E%3Cpath d='M16 22V10m-5 5 5-5 5 5' stroke='%23fff' stroke-width='3' fill='none' stroke-linecap='round' stroke-linejoin='round' transform='rotate(180 16 16)'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="organic.css">
+<link rel="stylesheet" href="app.css">
+</head>
+<body>
+<main class="shell">
+
+  <!-- 1 · Upload -->
+  <section class="screen" id="screen-upload" aria-labelledby="upload-title">
+    <header class="top">
+      <div class="wordmark">Backdate<span>.dwg</span></div>
+      <span class="tag tag-neutral">Free · no sign-up</span>
+    </header>
+
+    <h1 id="upload-title" class="hero">Open any AutoCAD file in any version.</h1>
+    <p class="lede">Upload a DWG or DXF and save it as an older release. Problems are skipped and listed in a report.</p>
+
+    <div class="cols cols-upload">
+      <div class="drop" id="drop" data-state="empty">
+        <input type="file" id="file-input" accept=".dwg,.dxf" hidden>
+
+        <div class="drop-empty">
+          <div class="disc disc-accent" aria-hidden="true">
+            <svg width="30" height="30" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.75" stroke-linecap="round" stroke-linejoin="round"><path d="M12 16V4"/><path d="m6 10 6-6 6 6"/><path d="M4 20h16"/></svg>
+          </div>
+          <div class="drop-title">Drop your file here</div>
+          <div class="muted" id="drop-hint">.dwg or .dxf, up to 200 MB</div>
+        </div>
+
+        <div class="drop-file">
+          <div class="disc disc-sage badge" id="pick-badge" aria-hidden="true">DWG</div>
+          <div class="drop-title file-name" id="pick-name"></div>
+          <div class="muted" id="pick-meta"></div>
+        </div>
+
+        <div class="drop-error" id="drop-error" role="alert" hidden>
+          <span class="tag tag-accent" id="drop-error-tag">Can't use this file</span>
+          <p id="drop-error-msg"></p>
+        </div>
+
+        <div class="drop-actions">
+          <button type="button" class="btn btn-primary" id="choose-btn">Choose file</button>
+          <button type="button" class="btn btn-primary" id="convert-btn" hidden>Convert to 2010</button>
+          <button type="button" class="btn btn-ghost" id="rechoose-btn" hidden>Choose a different file</button>
+        </div>
+      </div>
+
+      <div class="panel options">
+        <fieldset>
+          <legend>Convert to</legend>
+          <div class="chips" id="target-chips" role="radiogroup" aria-label="Target AutoCAD version"></div>
+          <p class="hint" id="target-hint" hidden></p>
+        </fieldset>
+        <fieldset>
+          <legend>Format</legend>
+          <div class="chips chips-sage" id="format-chips" role="radiogroup" aria-label="Output format">
+            <label class="chip"><input type="radio" name="format" value="DWG" checked><span>DWG</span></label>
+            <label class="chip"><input type="radio" name="format" value="DXF"><span>DXF</span></label>
+          </div>
+          <p class="hint" id="format-hint" hidden></p>
+        </fieldset>
+      </div>
+    </div>
+  </section>
+
+  <!-- 2 · Converting -->
+  <section class="screen" id="screen-converting" aria-labelledby="converting-title" hidden>
+    <header class="top">
+      <div class="wordmark">Backdate<span>.dwg</span></div>
+    </header>
+
+    <div class="panel file-row">
+      <div class="disc disc-sage badge badge-sm" id="conv-badge" aria-hidden="true">DWG</div>
+      <div class="file-row-text">
+        <div class="file-name" id="conv-name"></div>
+        <div class="muted small" id="conv-meta"></div>
+      </div>
+      <svg class="arrow" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.75" stroke-linecap="round" stroke-linejoin="round" aria-label="to"><path d="M5 12h14"/><path d="m12 5 7 7-7 7"/></svg>
+      <span class="tag tag-accent" id="conv-target">2010</span>
+    </div>
+
+    <h2 id="converting-title" class="title">Converting to 2010…</h2>
+    <p class="lede" id="conv-lede">Rewriting blocks and layers. This usually takes under a minute.</p>
+
+    <div class="bar" role="progressbar" aria-labelledby="converting-title" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" id="bar">
+      <div class="bar-fill" id="bar-fill"></div>
+    </div>
+    <div class="bar-meta"><span id="bar-pct">0%</span><span id="bar-eta">Starting…</span></div>
+
+    <ol class="steps" id="steps" aria-live="polite"></ol>
+
+    <button type="button" class="btn btn-ghost cancel" id="cancel-btn">Cancel</button>
+  </section>
+
+  <!-- 3 · Download -->
+  <section class="screen" id="screen-done" aria-labelledby="done-title" hidden>
+    <header class="top">
+      <div class="wordmark">Backdate<span>.dwg</span></div>
+    </header>
+
+    <div class="cols cols-done">
+      <div class="done-main">
+        <div class="disc disc-sage disc-lg" aria-hidden="true">
+          <svg width="34" height="34" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.75" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg>
+        </div>
+        <h2 id="done-title" class="title title-done">Your 2010 file is ready.</h2>
+        <p class="lede" id="done-meta"></p>
+        <div class="row">
+          <a class="btn btn-primary" id="download-btn" href="#" download>Download DWG</a>
+          <button type="button" class="btn btn-secondary" id="again-btn">Convert another</button>
+        </div>
+        <p class="muted small note" id="expiry-note">Files are deleted after 1 hour.</p>
+      </div>
+
+      <div class="panel report">
+        <div class="report-head">
+          <h3 class="report-title">Conversion report</h3>
+          <span class="tag tag-accent" id="report-tag">0 skipped</span>
+        </div>
+        <p class="muted small" id="report-intro"></p>
+        <ul class="report-list" id="report-list"></ul>
+        <button type="button" class="btn btn-ghost report-more" id="report-more" hidden>Show all</button>
+        <a class="btn btn-ghost report-dl" id="report-dl" href="#" download>Download report (.txt)</a>
+      </div>
+    </div>
+  </section>
+
+</main>
+<script src="app.js"></script>
+</body>
+</html>
