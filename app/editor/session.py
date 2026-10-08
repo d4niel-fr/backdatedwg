@@ -98,6 +98,8 @@ class EditorSession:
         self.fingerprint = fingerprint
         self.memory = memory  # MemoryStore or None
         self.previous: Optional[dict] = None  # what was remembered when this drawing was opened
+        self.original_path: Optional[Path] = None  # the file as uploaded, for the proof pack
+        self._original = zlib.compress(dump(doc).encode("utf-8"), 1)  # the drawing as opened, for "what changed since"
         self.name = name
         self.doc = doc
         self.dir = root / sid
@@ -281,7 +283,8 @@ class EditorSession:
                 if other.status == "pending":
                     other.status = "stale"
                     other.doc = None  # type: ignore[assignment]
-            self.log.append({"rev": self.rev, "time": int(time.time()), "summaries": p.summaries, "prompt": p.prompt, "source": p.source})
+            applied_ops = [o for st in p.steps for o in st["ops"]] if p.steps else p.ops
+            self.log.append({"rev": self.rev, "time": int(time.time()), "summaries": p.summaries, "prompt": p.prompt, "source": p.source, "ops": applied_ops})
             if self.memory is not None:
                 self.memory.add_change(self.fingerprint, p.summaries, p.prompt)
             return p
@@ -343,6 +346,9 @@ class EditorSession:
 
                     self.memory.alias(file_fingerprint(path), self.fingerprint)  # reopening the edited copy remembers too
             return path
+
+    def original_doc(self) -> Drawing:
+        return parse(zlib.decompress(self._original).decode("utf-8"))
 
     def index(self) -> dict:
         """Searchable summary: layers, blocks and (many more) labels than the digest keeps."""

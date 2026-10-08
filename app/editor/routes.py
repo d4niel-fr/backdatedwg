@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import io
 import json
 import os
 import queue
@@ -11,7 +12,7 @@ import uuid
 from pathlib import Path
 from typing import Optional
 
-from fastapi import APIRouter, FastAPI, File, Request, UploadFile
+from fastapi import APIRouter, FastAPI, File, Query, Request, UploadFile
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field
 
@@ -19,7 +20,7 @@ from .. import converter
 from ..engines import CancelToken
 from ..jobs import Job
 from ..versions import BY_YEAR, TARGET_YEARS, DetectError, detect, order
-from . import agent, analysis, llm, ops, sample, standards
+from . import agent, analysis, compare, exports, llm, ops, sample, standards
 from .memory import file_fingerprint
 from .session import AI_LIMIT, EditorError, EditorSession, EditorStore
 
@@ -114,6 +115,9 @@ def _open(request: Request, src: Path, name: str, det, work: Path):
         return error(422, e.code, e.message)
     label = f"{det.kind}, {det.version.label}" if det.version else det.kind
     session = store(request).create(doc, name, notes, label, fingerprint=file_fingerprint(src))
+    keep = session.dir / ("original" + src.suffix.lower())
+    shutil.copyfile(src, keep)
+    session.original_path = keep
     return JSONResponse(session.summary(), status_code=201)
 
 
@@ -440,3 +444,192 @@ def forget_memory(sid: str, request: Request):
         store(request).memory.forget(s.fingerprint)
     s.previous = None
     return None
+
+
+# ── compare revisions ───────────────────────────────────────────────────────
+
+
+def _compare_payload(s: EditorSession, result: dict, other_name: str) -> dict:
+    s.last_compare = {"result": result, "other": other_name}  # type: ignore[attr-defined]
+    out = {k: v for k, v in result.items() if k not in ("added", "removed", "changed")}
+    out["added"], out["removed"], out["changed"] = result["added"][:5000], result["removed"][:5000], result["changed"][:5000]
+    out["other"] = other_name
+    out["reportUrl"] = f"/api/editor/sessions/{s.id}/compare/report.txt"
+    return out
+
+
+@router.post("/sessions/{sid}/compare/original")
+def compare_original(sid: str, request: Request):
+    """What changed since the drawing was opened."""
+    s = session_of(request, sid)
+    with s.lock:
+        result = compare.compare(s.original_doc(), s.doc, s.units())
+    return _compare_payload(s, result, f"{s.name} (as opened)")
+
+
+@router.post("/sessions/{sid}/compare")
+async def compare_file(sid: str, request: Request, file: UploadFile = File(...)):
+    """Compare another revision (older) with the drawing that is open (newer)."""
+    s = session_of(request, sid)
+    jobs = request.app.state.jobs
+    name = Path(file.filename or "other").name
+    if Path(name).suffix.lower() not in ALLOWED_EXT:
+        return error(415, "unsupported_type", "Only .dwg and .dxf files can be compared.")
+    work = store(request).root / f"_cmp-{uuid.uuid4().hex}"
+    work.mkdir(parents=True)
+    try:
+        src = work / ("other" + Path(name).suffix.lower())
+        size = 0
+        with src.open("wb") as out:
+            while chunk := await file.read(1024 * 1024):
+                size += len(chunk)
+                if size > MAX_UPLOAD:
+                    return error(413, "too_large", f"That file is over {MAX_UPLOAD // (1024 * 1024)} MB.")
+                out.write(chunk)
+        with src.open("rb") as fh:
+            head = fh.read(64 * 1024)
+        try:
+            det = detect(head, name)
+        except DetectError as e:
+            return error(422, "unsupported_type", str(e))
+        if det.kind == "DWG" and not jobs.engines.can_read_dwg:
+            return error(503, "no_engine", "This server can't read DWG files yet. Upload a DXF instead.")
+        try:
+            other, _a, _n = converter._load(src, det, jobs.engines, work / "read", CancelToken())
+        except converter.ConversionError as e:
+            return error(422, e.code, e.message)
+        with s.lock:
+            result = compare.compare(other, s.doc, s.units())
+        return _compare_payload(s, result, name)
+    finally:
+        await file.close()
+        shutil.rmtree(work, ignore_errors=True)
+
+
+@router.get("/sessions/{sid}/compare/report.txt")
+def compare_report(sid: str, request: Request):
+    s = session_of(request, sid)
+    last = getattr(s, "last_compare", None)
+    if not last:
+        return error(404, "not_found", "Compare the drawing with another revision first.")
+    text = compare.report_text(last["result"], last["other"], s.name)
+    return Response(text, media_type="text/plain; charset=utf-8", headers={"Content-Disposition": f'attachment; filename="{Path(s.name).stem}_comparison.txt"'})
+
+
+class CloudsBody(BaseModel):
+    rev: str = Field(default="A", min_length=1, max_length=8)
+    description: str = Field(default="Revised as marked", max_length=200)
+    table: bool = True
+
+
+@router.post("/sessions/{sid}/compare/clouds")
+def compare_clouds(sid: str, body: CloudsBody, request: Request):
+    """Revision clouds around everything the last comparison found, plus a revision-table row."""
+    s = session_of(request, sid)
+    last = getattr(s, "last_compare", None)
+    if not last or not last["result"].get("regions"):
+        return error(409, "nothing_compared", "Compare with another revision first; there are no changed areas to mark.")
+    ext = s.digest().get("extents")
+    at = (ext[2] + s.text_height() * 4, ext[1] + s.text_height() * 12) if (ext and body.table) else None
+    from datetime import date
+
+    steps = compare.cloud_steps(last["result"], body.rev.upper(), body.description, date.today().isoformat(), at, s.text_height())
+    try:
+        prop = s.stage([], [], "compare", f"Mark revision {body.rev.upper()}", steps=steps,
+                       why="Each cloud surrounds a group of objects that differ between the two revisions.")
+    except ops.OpError as e:
+        return error(422, "bad_ops", str(e))
+    return {"proposal": prop.view()}
+
+
+# ── exports ─────────────────────────────────────────────────────────────────
+
+
+def _download(data: bytes, media: str, filename: str) -> Response:
+    return Response(data, media_type=media, headers={"Content-Disposition": f'attachment; filename="{filename}"'})
+
+
+@router.get("/sessions/{sid}/export.pdf")
+def export_pdf(sid: str, request: Request, paper: str = "A3", orientation: str = "landscape", hidden: list[str] = Query(default=[]),
+               title: str = "", project: str = "", drawn_by: str = "", rev: str = "", date: str = ""):
+    s = session_of(request, sid)
+    u = s.units()
+    data, _info = exports.drawing_pdf(s.scene(), units_to_m=u.to_m, units_name=u.name, units_guessed=u.guessed, name=s.name,
+                                      hidden=hidden, paper=paper, orientation=orientation,
+                                      fields={"title": title[:80], "project": project[:60], "drawn_by": drawn_by[:40], "rev": rev[:8], "date": date[:20]})
+    return _download(data, "application/pdf", f"{Path(s.name).stem}.pdf")
+
+
+@router.get("/sessions/{sid}/export.svg")
+def export_svg(sid: str, request: Request, hidden: list[str] = Query(default=[])):
+    s = session_of(request, sid)
+    return _download(exports.drawing_svg(s.scene(), hidden, s.name).encode("utf-8"), "image/svg+xml", f"{Path(s.name).stem}.svg")
+
+
+def _changelog_text(s: EditorSession) -> str:
+    lines = [f"Change log: {s.name}", f"Opened as: {s.source_label}", f"Changes accepted: {sum(1 for e in s.log if e.get('source') != 'history')}", ""]
+    from datetime import datetime as _dt
+
+    for e in s.log:
+        lines.append(f"Change {e['rev']} · {_dt.fromtimestamp(e['time']).strftime('%Y-%m-%d %H:%M')} · {e['source']}")
+        if e.get("prompt"):
+            lines.append(f'  Asked: "{e["prompt"]}"')
+        lines += [f"  - {x}" for x in e["summaries"]]
+        lines.append("")
+    if not s.log:
+        lines.append("No changes were accepted.")
+    return "\n".join(lines) + "\n"
+
+
+@router.get("/sessions/{sid}/changelog.txt")
+def changelog_txt(sid: str, request: Request):
+    s = session_of(request, sid)
+    return Response(_changelog_text(s), media_type="text/plain; charset=utf-8", headers={"Content-Disposition": f'attachment; filename="{Path(s.name).stem}_changes.txt"'})
+
+
+@router.get("/sessions/{sid}/changelog.pdf")
+def changelog_pdf(sid: str, request: Request):
+    s = session_of(request, sid)
+    data = exports.changelog_pdf(s.name, s.log, f"Opened as {s.source_label}. {len(s.log)} entr{'y' if len(s.log) == 1 else 'ies'}.")
+    return _download(data, "application/pdf", f"{Path(s.name).stem}_changes.pdf")
+
+
+@router.get("/sessions/{sid}/proof-pack.zip")
+def proof_pack(sid: str, request: Request):
+    """Everything needed to show what was done: before and after, the exact operations, comparison, health, PDFs."""
+    from . import health as health_mod
+    from . import geometry as geometry_mod
+    from . import digest as digest_mod
+
+    s = session_of(request, sid)
+    stem = Path(s.name).stem
+    with s.lock:
+        original = s.original_doc()
+        cmp = compare.compare(original, s.doc, s.units())
+        o_scene = geometry_mod.extract(original)
+        o_digest = digest_mod.build(original, o_scene, s.units(), s.name)
+        before = health_mod.check(original, o_scene, s.units(), o_digest)
+        after = s.health()
+        edited = s.write_current().read_bytes()
+        u = s.units()
+        pdf, info = exports.drawing_pdf(s.scene(), units_to_m=u.to_m, units_name=u.name, units_guessed=u.guessed, name=s.name)
+    files: dict[str, bytes] = {}
+    if s.original_path and s.original_path.exists():
+        files[f"original/{s.name}"] = s.original_path.read_bytes()
+    else:
+        buf = io.StringIO()
+        original.write(buf)
+        files[f"original/{stem}.dxf"] = buf.getvalue().encode("utf-8")
+    files[f"edited/{stem}_edited.dxf"] = edited
+    files["changes/changelog.txt"] = _changelog_text(s).encode("utf-8")
+    files["changes/changelog.pdf"] = exports.changelog_pdf(s.name, s.log, f"Opened as {s.source_label}.")
+    files["changes/operations.json"] = json.dumps(s.log, indent=2, ensure_ascii=False).encode("utf-8")
+    slim = {k: v for k, v in cmp.items() if k not in ("overlay",)}
+    files["comparison/comparison.txt"] = compare.report_text(cmp, f"{s.name} (as opened)", f"{stem}_edited.dxf").encode("utf-8")
+    files["comparison/comparison.json"] = json.dumps(slim, indent=2, ensure_ascii=False).encode("utf-8")
+    files["health/before.json"] = json.dumps(before, indent=2, ensure_ascii=False).encode("utf-8")
+    files["health/after.json"] = json.dumps(after, indent=2, ensure_ascii=False).encode("utf-8")
+    files[f"{stem}_edited.pdf"] = pdf
+    meta = {"drawing": s.name, "openedAs": s.source_label, "changes": len(s.log), "healthBefore": before["score"],
+            "healthAfter": after["score"], "comparison": cmp["summary"], "pdfScale": f"1:{info['scale']} @ {info['paper']}"}
+    return _download(exports.proof_pack(files, meta), "application/zip", f"{stem}_proof_pack.zip")
