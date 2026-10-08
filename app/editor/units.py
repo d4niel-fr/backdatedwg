@@ -72,8 +72,24 @@ class Units:
         raise UnitError(f"Expected a length, got {value!r}.")
 
     def show(self, value: float) -> str:
-        """A length for people, in the drawing's own unit."""
-        return f"{value:,.4g} {self.short}" if abs(value) < 1e6 else f"{value:,.0f} {self.short}"
+        """A length for people, in the drawing's own unit: 10,000 mm, 3.5 m, 0.25 m."""
+        return f"{fmt_number(value)} {self.short}"
+
+
+def fmt_number(value: float) -> str:
+    """Thousands separators, no scientific notation, at most 4 significant decimals."""
+    v = float(value)
+    if v == 0:
+        return "0"
+    if abs(v) >= 100:
+        text = f"{v:,.1f}"
+    elif abs(v) >= 1:
+        text = f"{v:,.3f}"
+    else:
+        text = f"{v:.4g}"
+        if "e" in text:
+            return f"{v:.6f}".rstrip("0").rstrip(".")
+    return text.rstrip("0").rstrip(".") if "." in text else text
 
 
 def detect_units(code: int | None, extent_max: float | None) -> Units:

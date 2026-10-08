@@ -110,6 +110,7 @@ class EditorSession:
         self._digest: Optional[tuple[int, dict]] = None
         self._units: Optional[tuple[int, Units]] = None
         self._geometry: Optional[tuple[int, bytes]] = None
+        self._health: Optional[tuple[int, dict]] = None
 
     # ── derived, cached per revision ──────────────────────────────────────
     def scene(self) -> Scene:
@@ -139,6 +140,14 @@ class EditorSession:
             if self._digest is None or self._digest[0] != self.rev:
                 self._digest = (self.rev, digest_mod.build(self.doc, self.scene(), self.units(), self.name))
             return self._digest[1]
+
+    def health(self) -> dict:
+        from . import health as health_mod
+
+        with self.lock:
+            if self._health is None or self._health[0] != self.rev:
+                self._health = (self.rev, health_mod.check(self.doc, self.scene(), self.units(), self.digest()))
+            return self._health[1]
 
     def text_height(self) -> float:
         size = (self.digest().get("size") or [1000, 1000])

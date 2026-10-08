@@ -16,7 +16,7 @@ from .. import converter
 from ..engines import CancelToken
 from ..jobs import Job
 from ..versions import BY_YEAR, TARGET_YEARS, DetectError, detect, order
-from . import agent, llm, ops, sample
+from . import agent, analysis, llm, ops, sample, standards
 from .session import AI_LIMIT, EditorError, EditorSession, EditorStore
 
 router = APIRouter(prefix="/api/editor")
@@ -251,3 +251,108 @@ def export(sid: str, body: ExportBody, request: Request):
         raise
     jobs.submit(job)
     return job.to_dict()
+
+
+# ── reading the drawing ─────────────────────────────────────────────────────
+
+
+def _csv(text: str, name: str) -> Response:
+    return Response(text, media_type="text/csv", headers={"Content-Disposition": f'attachment; filename="{name}"'})
+
+
+@router.get("/sessions/{sid}/health")
+def health(sid: str, request: Request):
+    return session_of(request, sid).health()
+
+
+class HandlesBody(BaseModel):
+    handles: list[str] = Field(min_length=1, max_length=5000)
+
+
+@router.post("/sessions/{sid}/inspect")
+def inspect(sid: str, body: HandlesBody, request: Request):
+    s = session_of(request, sid)
+    with s.lock:
+        return {"items": analysis.inspect(s.doc, body.handles, s.units())}
+
+
+class AreaBody(BaseModel):
+    bbox: list[float] = Field(min_length=4, max_length=4)
+
+
+@router.post("/sessions/{sid}/area")
+def area(sid: str, body: AreaBody, request: Request):
+    s = session_of(request, sid)
+    with s.lock:
+        summary = analysis.area_summary(s.doc, s.scene(), body.bbox, s.units())
+    return {**summary, "text": analysis.describe_area(summary)}
+
+
+@router.get("/sessions/{sid}/takeoff")
+def takeoff(sid: str, request: Request, format: str = "json"):
+    s = session_of(request, sid)
+    with s.lock:
+        t = analysis.takeoff(s.doc, s.units())
+    if format == "csv":
+        return _csv(analysis.takeoff_csv(t), f"{Path(s.name).stem}_takeoff.csv")
+    return t
+
+
+@router.get("/sessions/{sid}/rooms")
+def rooms(sid: str, request: Request, min_area: float = 1.0):
+    s = session_of(request, sid)
+    with s.lock:
+        rows = analysis.rooms(s.doc, s.units(), min_area_m2=max(0.0, min_area))
+    return {"rooms": rows, "totalSquareMetres": round(sum(r["squareMetres"] for r in rows if r["name"] != "(unnamed)"), 2)}
+
+
+@router.get("/sessions/{sid}/schedule")
+def schedule(sid: str, request: Request, block: Optional[str] = None, mode: str = "instances", format: str = "json"):
+    if mode not in ("instances", "bom"):
+        return error(400, "bad_mode", "mode must be instances or bom.")
+    s = session_of(request, sid)
+    with s.lock:
+        table = analysis.schedule(s.doc, block, mode)
+    if format == "csv":
+        return _csv(analysis.table_csv(table), f"{Path(s.name).stem}_{'bom' if mode == 'bom' else 'schedule'}.csv")
+    return table
+
+
+@router.get("/sessions/{sid}/explain")
+def explain(sid: str, request: Request):
+    s = session_of(request, sid)
+    h = s.health()
+    with s.lock:
+        return analysis.explain(s.doc, s.digest(), s.units(), {"score": h["score"], "issues": h["issues"]})
+
+
+@router.get("/sessions/{sid}/warehouse")
+def warehouse(sid: str, request: Request, min_aisle: float = 2.8):
+    s = session_of(request, sid)
+    with s.lock:
+        return analysis.warehouse(s.doc, s.units(), min_aisle_m=max(0.1, min_aisle))
+
+
+@router.get("/sessions/{sid}/standards")
+def standards_proposal(sid: str, request: Request):
+    s = session_of(request, sid)
+    with s.lock:
+        return standards.propose(s.doc)
+
+
+class MappingBody(BaseModel):
+    mapping: str = Field(min_length=1, max_length=200_000)
+
+
+@router.post("/sessions/{sid}/standards/custom")
+def standards_custom(sid: str, body: MappingBody, request: Request):
+    s = session_of(request, sid)
+    try:
+        mapping = standards.parse_mapping(body.mapping)
+    except ValueError as e:
+        return error(422, "bad_mapping", str(e))
+    try:
+        prop = s.stage([{"op": "map_layers", "mapping": mapping}], [], "standards", "Apply a custom layer mapping")
+    except ops.OpError as e:
+        return error(422, "bad_ops", str(e))
+    return {"proposal": prop.view()}

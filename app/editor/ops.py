@@ -582,7 +582,15 @@ def _add_text(ctx: Ctx, a: dict) -> None:
     _created(ctx, e, f"Add text “{text[:40]}”")
 
 
-@op("replace_text", ["find", "replace", "selector", "case_sensitive"], "replace_text(find, replace, selector?, case_sensitive?)  replace text in TEXT/MTEXT/block attributes; the whole drawing unless a selector is given.")
+def _case_like(right: str, found: str) -> str:
+    if found.isupper():
+        return right.upper()
+    if found[:1].isupper():
+        return right[:1].upper() + right[1:]
+    return right
+
+
+@op("replace_text", ["find", "replace", "selector", "case_sensitive", "match_case_of_found"], "replace_text(find, replace, selector?, case_sensitive?)  replace text in TEXT/MTEXT/block attributes; the whole drawing unless a selector is given.")
 def _replace_text(ctx: Ctx, a: dict) -> None:
     find, repl = a.get("find"), a.get("replace")
     if not isinstance(find, str) or not find or not isinstance(repl, str):
@@ -606,7 +614,10 @@ def _replace_text(ctx: Ctx, a: dict) -> None:
         touched = False
         for obj, field_name in targets:
             current = obj.text if kind == "MTEXT" and obj is e else obj.dxf.get(field_name, "")
-            new, n = pattern.subn(repl.replace("\\", "\\\\"), current)
+            if a.get("match_case_of_found"):
+                new, n = pattern.subn(lambda m: _case_like(repl, m.group(0)), current)
+            else:
+                new, n = pattern.subn(repl.replace("\\", "\\\\"), current)
             if n:
                 if kind == "MTEXT" and obj is e:
                     obj.text = new
@@ -1243,6 +1254,55 @@ def _detach_xref(ctx: Ctx, a: dict) -> None:
     ctx.out.summaries.append(f"Detach xref {name} ({len(refs)} placement{'s' if len(refs) != 1 else ''})")
 
 
+@op("map_layers", ["mapping", "colors"], 'map_layers(mapping={"old": "NEW", ...}, colors?={"NEW": 3})  rename or merge many layers at once (layer standards).')
+def _map_layers(ctx: Ctx, a: dict) -> None:
+    mapping = a.get("mapping")
+    if not isinstance(mapping, dict) or not mapping or len(mapping) > 2000:
+        raise OpError("map_layers: 'mapping' must be an object of up to 2000 old: new layer names.")
+    existing = {l.dxf.name.lower(): l.dxf.name for l in ctx.doc.layers}
+    pairs = []
+    for old, new in mapping.items():
+        if str(old).lower() in PROTECTED_LAYERS or str(old).lower() not in existing:
+            continue
+        new = _layer_name(new, "map_layers")
+        if existing[str(old).lower()] == new:
+            continue
+        pairs.append((existing[str(old).lower()], new))
+    if not pairs:
+        raise OpError("map_layers: none of those layers exist or need renaming.")
+    by_old = {o.lower(): n for o, n in pairs}
+    for old, new in pairs:
+        if not ctx.doc.layers.has_entry(new):
+            src = ctx.doc.layers.get(old)
+            dst = ctx.doc.layers.add(new)
+            dst.dxf.color, dst.dxf.linetype = abs(src.dxf.color), src.dxf.linetype
+    msp_handles = {e.dxf.handle for e in ctx.msp}
+    moved = 0
+    for e in list(ctx.doc.entitydb.values()):
+        if e.dxf.hasattr("layer"):
+            new = by_old.get(e.dxf.layer.lower())
+            if new and new != e.dxf.layer:
+                e.dxf.layer = new
+                if e.dxf.handle in msp_handles:
+                    ctx.out.touched.changed.add(e.dxf.handle)
+                    moved += 1
+    for old, _new in pairs:
+        if ctx.doc.layers.has_entry(old) and old.lower() not in {n.lower() for _o, n in pairs}:
+            try:
+                ctx.doc.layers.remove(old)
+            except DXFError:
+                pass
+    colors = a.get("colors") or {}
+    if not isinstance(colors, dict):
+        raise OpError("map_layers: 'colors' must be an object of layer: colour.")
+    for name, c in colors.items():
+        if ctx.doc.layers.has_entry(str(name)):
+            ctx.doc.layers.get(str(name)).color = _color_index(c, "map_layers.colors")
+    ctx.out.touched.tables = True
+    merged = len(pairs) - len({n.lower() for _o, n in pairs})
+    ctx.out.summaries.append(f"Rename {len(pairs)} layer{'s' if len(pairs) != 1 else ''} to the standard ({moved:,} objects moved" + (f", {merged} merged" if merged else "") + ")")
+
+
 def vocabulary() -> str:
     """The operation list, in the form given to the model."""
     return "\n".join(spec.doc for spec in OPS.values())
@@ -1271,12 +1331,15 @@ def apply_ops(doc: Drawing, ops: list, units: Units, selection: list[str], text_
         spec = OPS.get(raw["op"])
         if spec is None:
             raise OpError(f"Operation {i}: unknown op {raw['op']!r}. Available: {', '.join(OPS)}.")
-        extra = set(raw) - spec.keys - {"op"}
+        extra = set(raw) - spec.keys - {"op", "optional"}
         if extra:
             raise OpError(f"Operation {i} ({spec.name}): unknown fields {sorted(extra)}. Allowed: {sorted(spec.keys)}.")
         try:
-            spec.fn(ctx, raw)
+            spec.fn(ctx, {k: v for k, v in raw.items() if k != "optional"})
         except OpError as e:
+            if raw.get("optional") is True:  # "if there's anything to do": nothing to do is fine
+                out.warnings.append(f"Skipped {spec.name}: {str(e).removeprefix(spec.name + ': ')}")
+                continue
             raise OpError(f"Operation {i} ({spec.name}): {e}" if not str(e).startswith(spec.name) else f"Operation {i}: {e}") from e
     # An entity that was changed and then deleted (or created and deleted) is just deleted / nothing.
     t = out.touched
