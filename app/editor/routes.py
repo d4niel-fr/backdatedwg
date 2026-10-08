@@ -20,7 +20,7 @@ from .. import converter
 from ..engines import CancelToken
 from ..jobs import Job
 from ..versions import BY_YEAR, TARGET_YEARS, DetectError, detect, order
-from . import agent, analysis, compare, exports, importers, llm, ops, sample, standards
+from . import agent, analysis, batch, compare, exports, importers, llm, ops, sample, standards
 from .memory import file_fingerprint
 from .session import AI_LIMIT, EditorError, EditorSession, EditorStore
 
@@ -689,3 +689,119 @@ def proof_pack(sid: str, request: Request):
     meta = {"drawing": s.name, "openedAs": s.source_label, "changes": len(s.log), "healthBefore": before["score"],
             "healthAfter": after["score"], "comparison": cmp["summary"], "pdfScale": f"1:{info['scale']} @ {info['paper']}"}
     return _download(exports.proof_pack(files, meta), "application/zip", f"{stem}_proof_pack.zip")
+
+
+# ── recipes and batch jobs ──────────────────────────────────────────────────
+
+
+@router.get("/sessions/{sid}/recipe")
+def recipe_from_session(sid: str, request: Request):
+    """The changes accepted so far, as a recipe to replay on other drawings."""
+    s = session_of(request, sid)
+    try:
+        return batch.recipe_from_log(s.name, s.log)
+    except batch.RecipeError as e:
+        return error(409, "nothing_recorded", str(e))
+
+
+class RecipeBody(BaseModel):
+    recipe: dict
+
+
+@router.post("/recipes/validate")
+def validate_recipe(body: RecipeBody):
+    try:
+        return {"recipe": batch.validate_recipe(body.recipe)}
+    except batch.RecipeError as e:
+        return error(422, "bad_recipe", str(e))
+
+
+@router.post("/sessions/{sid}/recipe/apply")
+def apply_recipe_here(sid: str, body: RecipeBody, request: Request):
+    """Run a recipe on the open drawing, as one step-by-step proposal."""
+    s = session_of(request, sid)
+    try:
+        recipe = batch.validate_recipe(body.recipe)
+    except batch.RecipeError as e:
+        return error(422, "bad_recipe", str(e))
+    steps = []
+    for cmd in recipe["commands"]:
+        plan = agent.local_plan(s, cmd)
+        if plan:
+            steps += plan[0]
+            continue
+        parsed = agent.local_ops(cmd)
+        if parsed is None:
+            return error(422, "bad_recipe", f"“{cmd}” isn't a built-in command.")
+        steps.append({"title": cmd, "ops": [{**o, "optional": True} for o in parsed[0]]})
+    if recipe["ops"]:
+        steps.append({"title": "Operations", "ops": [{**o, "optional": True} for o in recipe["ops"]]})
+    steps += [{"title": st.get("title") or "Step", "ops": [{**o, "optional": True} for o in st["ops"]]} for st in recipe["steps"]]
+    try:
+        prop = s.stage([], [], "recipe", f"Recipe: {recipe['name']}", steps=steps[:8],
+                       why="These are the recipe's steps; any that find nothing to do in this drawing are skipped.")
+    except ops.OpError as e:
+        return error(422, "bad_ops", str(e))
+    return {"proposal": prop.view(), "truncated": len(steps) > 8}
+
+
+def batches(request: Request) -> batch.BatchManager:
+    return request.app.state.batches
+
+
+@router.post("/batch", status_code=201)
+async def create_batch(request: Request, files: list[UploadFile] = File(...), recipe: str = Form(...),
+                       dry_run: bool = Form(False), callback_url: Optional[str] = Form(None)):
+    try:
+        rec = batch.validate_recipe(recipe)
+        if callback_url:
+            batch.check_callback(callback_url)
+    except (batch.RecipeError, batch.WebhookError) as e:
+        return error(422, "bad_request", str(e))
+    if not files or len(files) > batch.MAX_FILES:
+        return error(400, "bad_files", f"Send 1 to {batch.MAX_FILES} drawings.")
+    if rec["output"]["format"] == "DWG" and not request.app.state.jobs.engines.can_write("DWG"):
+        return error(400, "no_engine", "This server can't write DWG files (ODA File Converter isn't installed). Choose DXF.")
+    mgr = batches(request)
+    jid, d = mgr.new_dir()
+    saved = []
+    for i, f in enumerate(files):
+        name = Path(f.filename or f"drawing{i}.dxf").name
+        if Path(name).suffix.lower() not in batch.DRAWING_EXT:
+            shutil.rmtree(d, ignore_errors=True)
+            return error(415, "unsupported_type", f"{name} isn't a .dwg or .dxf file.")
+        dest = d / "in" / name
+        if dest.exists():
+            dest = d / "in" / f"{Path(name).stem}_{i}{Path(name).suffix}"
+        dest.write_bytes(await _read_upload(f))
+        saved.append(dest)
+    job = mgr.submit(batch.BatchJob(jid, d, saved, rec, dry_run=dry_run, callback=callback_url))
+    return job.view()
+
+
+def _batch(request: Request, jid: str) -> batch.BatchJob:
+    job = batches(request).get(jid)
+    if not job:
+        raise EditorError(404, "not_found", "That batch has expired.")
+    return job
+
+
+@router.get("/batch/{jid}")
+def get_batch(jid: str, request: Request):
+    return _batch(request, jid).view()
+
+
+@router.get("/batch/{jid}/download")
+def download_batch(jid: str, request: Request):
+    job = _batch(request, jid)
+    if not job.zip_path or not job.zip_path.exists():
+        return error(404, "not_ready", "The results aren't ready (or this was a dry run).")
+    return FileResponse(job.zip_path, media_type="application/zip", filename=job.zip_path.name)
+
+
+@router.get("/batch/{jid}/report.txt")
+def batch_report(jid: str, request: Request):
+    job = _batch(request, jid)
+    if not job.report:
+        return error(404, "not_ready", "The report isn't ready yet.")
+    return Response(job.report, media_type="text/plain; charset=utf-8", headers={"Content-Disposition": 'attachment; filename="batch_report.txt"'})
