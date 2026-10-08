@@ -20,7 +20,7 @@ from .. import converter
 from ..engines import CancelToken
 from ..jobs import Job
 from ..versions import BY_YEAR, TARGET_YEARS, DetectError, detect, order
-from . import agent, analysis, batch, compare, exports, importers, llm, ops, sample, standards
+from . import agent, analysis, batch, compare, exports, importers, llm, ops, sample, share, standards
 from .memory import file_fingerprint
 from .session import AI_LIMIT, EditorError, EditorSession, EditorStore
 
@@ -41,6 +41,19 @@ def install(app: FastAPI) -> None:
     @app.exception_handler(EditorError)
     async def _editor_error(_request: Request, exc: EditorError):  # noqa: ANN202
         return error(exc.status, exc.code, exc.message)
+
+    @app.exception_handler(share.ShareError)
+    async def _share_error(_request: Request, exc: share.ShareError):  # noqa: ANN202
+        return error(exc.status, exc.code, exc.message)
+
+
+def _who(request: Request) -> Optional[str]:
+    """The browser tab making a request (so it isn't sent its own live events)."""
+    return (request.headers.get("x-client-id") or "")[:40] or None
+
+
+def publish(request: Request, s: EditorSession, kind: str, data: dict) -> None:
+    s.bus.publish(kind, {**data, "rev": s.rev, "by": request.headers.get("x-client-name", "")[:40]}, exclude=_who(request))
 
 
 def store(request: Request) -> EditorStore:
@@ -237,7 +250,9 @@ def _chat_payload(session: EditorSession, body: ChatBody, result) -> dict:
 def chat(sid: str, body: ChatBody, request: Request):
     session = session_of(request, sid)
     result = agent.run(session, body.message, body.selection, _model(request), area=body.area)
-    return _chat_payload(session, body, result)
+    payload = _chat_payload(session, body, result)
+    publish(request, session, "chat", {"message": body.message, "reply": result.reply, "proposal": result.proposal, "data": result.data})
+    return payload
 
 
 @router.post("/sessions/{sid}/chat/stream")
@@ -252,7 +267,9 @@ def chat_stream(sid: str, body: ChatBody, request: Request):
         try:
             result = agent.run(session, body.message, body.selection, model, area=body.area,
                                emit=lambda kind, data: events.put((kind, data)))
-            events.put(("result", _chat_payload(session, body, result)))
+            payload = _chat_payload(session, body, result)
+            events.put(("result", payload))
+            publish(request, session, "chat", {"message": body.message, "reply": result.reply, "proposal": result.proposal, "data": result.data})
         except Exception as e:  # noqa: BLE001 - reported to the page, never a hung stream
             agent.log.exception("chat stream failed")
             events.put(("error", {"message": f"Something went wrong: {e}"}))
@@ -291,6 +308,7 @@ def stage(sid: str, body: StageBody, request: Request):
         prop = session.stage(body.ops, body.selection, "manual")
     except ops.OpError as e:
         return error(422, "bad_ops", str(e))
+    publish(request, session, "proposal", {"proposal": prop.view()})
     return {"proposal": prop.view()}
 
 
@@ -302,6 +320,7 @@ class AcceptBody(BaseModel):
 def accept(sid: str, pid: str, request: Request, body: Optional[AcceptBody] = None):
     session = session_of(request, sid)
     prop = session.accept(pid, steps=body.steps if body else None)
+    publish(request, session, "changed", {"what": "accepted", "proposal": prop.id, "summaries": prop.summaries})
     return {"proposal": {"id": prop.id, "status": prop.status, "summaries": prop.summaries},
             "summary": session.summary(), "suggestions": agent.suggestions(session, [])}
 
@@ -310,6 +329,7 @@ def accept(sid: str, pid: str, request: Request, body: Optional[AcceptBody] = No
 def reject(sid: str, pid: str, request: Request):
     session = session_of(request, sid)
     prop = session.reject(pid)
+    publish(request, session, "rejected", {"proposal": prop.id})
     return {"proposal": {"id": prop.id, "status": prop.status}}
 
 
@@ -317,6 +337,7 @@ def reject(sid: str, pid: str, request: Request):
 def undo(sid: str, request: Request):
     session = session_of(request, sid)
     label = session.undo()
+    publish(request, session, "changed", {"what": "undo", "label": label})
     return {"label": label, "summary": session.summary()}
 
 
@@ -324,6 +345,7 @@ def undo(sid: str, request: Request):
 def redo(sid: str, request: Request):
     session = session_of(request, sid)
     label = session.redo()
+    publish(request, session, "changed", {"what": "redo", "label": label})
     return {"label": label, "summary": session.summary()}
 
 
@@ -805,3 +827,196 @@ def batch_report(jid: str, request: Request):
     if not job.report:
         return error(404, "not_ready", "The report isn't ready yet.")
     return Response(job.report, media_type="text/plain; charset=utf-8", headers={"Content-Disposition": 'attachment; filename="batch_report.txt"'})
+
+
+# ── sharing ─────────────────────────────────────────────────────────────────
+
+
+def shares(request: Request) -> share.ShareStore:
+    return store(request).shares
+
+
+class ShareBody(BaseModel):
+    role: str = "viewer"
+    label: str = Field(default="", max_length=80)
+    days: Optional[float] = Field(default=None, gt=0, le=90)
+    allow_download: bool = True
+
+
+@router.post("/sessions/{sid}/shares", status_code=201)
+def create_share(sid: str, body: ShareBody, request: Request):
+    s = session_of(request, sid)
+    if body.role not in share.ROLES:
+        return error(400, "bad_role", "Role must be viewer, approver or editor.")
+    if body.role == "editor":
+        rec = shares(request).create_live(s)
+        return {**rec, "link": f"editor.html?join={rec['token']}"}
+    meta = shares(request).create_snapshot(body.role, s, body.label, body.days, body.allow_download)
+    return {**{k: meta[k] for k in ("token", "role", "label", "rev", "created", "expires", "allowDownload")}, "link": f"editor.html?share={meta['token']}"}
+
+
+@router.get("/sessions/{sid}/shares")
+def list_shares(sid: str, request: Request):
+    s = session_of(request, sid)
+    return {"shares": shares(request).for_session(s.id)}
+
+
+@router.delete("/sessions/{sid}/shares/{token}", status_code=204)
+def revoke_share(sid: str, token: str, request: Request):
+    s = session_of(request, sid)
+    owned = {r["token"] for r in shares(request).for_session(s.id)}
+    if token not in owned or not shares(request).revoke(token):
+        return error(404, "not_found", "That link doesn't belong to this drawing.")
+    return None
+
+
+@router.get("/sessions/{sid}/comments")
+def session_comments(sid: str, request: Request):
+    """Every comment left on this drawing's review links (for pins on the owner's view)."""
+    s = session_of(request, sid)
+    out = []
+    for r in shares(request).for_session(s.id):
+        if r["role"] == "editor":
+            continue
+        out += [{**c, "token": r["token"], "role": r["role"], "label": r["label"]} for c in shares(request).comments(r["token"])]
+    out.sort(key=lambda c: c["time"])
+    return {"comments": out}
+
+
+class CommentBody(BaseModel):
+    text: str = Field(min_length=1, max_length=2000)
+    author: str = Field(default="", max_length=60)
+    x: Optional[float] = None
+    y: Optional[float] = None
+    reply_to: Optional[str] = Field(default=None, max_length=32)
+
+
+def _owned(request: Request, s: EditorSession, token: str) -> None:
+    if token not in {r["token"] for r in shares(request).for_session(s.id)}:
+        raise share.ShareError(404, "not_found", "That link doesn't belong to this drawing.")
+
+
+@router.post("/sessions/{sid}/shares/{token}/comments", status_code=201)
+def owner_comment(sid: str, token: str, body: CommentBody, request: Request):
+    s = session_of(request, sid)
+    _owned(request, s, token)
+    return shares(request).add_comment(token, body.author or "Owner", body.text, body.x, body.y, body.reply_to, owner=True)
+
+
+class ResolveBody(BaseModel):
+    resolved: bool = True
+
+
+@router.post("/sessions/{sid}/shares/{token}/comments/{cid}/resolve")
+def resolve_comment(sid: str, token: str, cid: str, body: ResolveBody, request: Request):
+    s = session_of(request, sid)
+    _owned(request, s, token)
+    return shares(request).resolve(token, cid, body.resolved)
+
+
+# public side of a review link
+
+
+@router.get("/shares/{token}")
+def share_meta(token: str, request: Request):
+    meta = shares(request).meta(token)
+    return {k: v for k, v in meta.items() if k not in ("session",)}
+
+
+@router.get("/shares/{token}/geometry")
+def share_geometry(token: str, request: Request):
+    return FileResponse(shares(request).file(token, "geometry.json"), media_type="application/json")
+
+
+@router.get("/shares/{token}/drawing.dxf")
+def share_download(token: str, request: Request):
+    meta = shares(request).meta(token)
+    if not meta.get("allowDownload"):
+        return error(403, "not_allowed", "Downloading isn't allowed on this link.")
+    return FileResponse(shares(request).file(token, "drawing.dxf"), media_type="image/vnd.dxf", filename=f"{Path(meta['name']).stem}_rev{meta['rev']}.dxf")
+
+
+@router.get("/shares/{token}/export.pdf")
+def share_pdf(token: str, request: Request, paper: str = "A3"):
+    from .geometry import Scene
+
+    meta = shares(request).meta(token)
+    geo = json.loads(shares(request).file(token, "geometry.json").read_text("utf-8"))
+    scene = Scene(items=geo["items"], extents=geo["extents"])
+    data, _ = exports.drawing_pdf(scene, units_to_m=meta["unitsToMetres"], units_name=meta["unitsName"], units_guessed=meta["unitsGuessed"],
+                                  name=meta["name"], paper=paper, fields={"rev": str(meta["rev"])})
+    return _download(data, "application/pdf", f"{Path(meta['name']).stem}_rev{meta['rev']}.pdf")
+
+
+@router.get("/shares/{token}/comments")
+def share_comments(token: str, request: Request):
+    return {"comments": shares(request).comments(token)}
+
+
+@router.post("/shares/{token}/comments", status_code=201)
+def add_share_comment(token: str, body: CommentBody, request: Request):
+    meta = shares(request).meta(token)
+    c = shares(request).add_comment(token, body.author, body.text, body.x, body.y, body.reply_to)
+    owner = store(request).get(meta["session"])
+    if owner:
+        owner.bus.publish("comment", {"token": token, "comment": c, "label": meta["label"]})
+    return c
+
+
+class DecisionBody(BaseModel):
+    decision: str
+    author: str = Field(default="", max_length=60)
+    note: str = Field(default="", max_length=1000)
+
+
+@router.post("/shares/{token}/decision")
+def decide(token: str, body: DecisionBody, request: Request):
+    meta = shares(request).meta(token)
+    rec = shares(request).decide(token, body.author, body.decision, body.note)
+    owner = store(request).get(meta["session"])
+    if owner:
+        owner.bus.publish("decision", {"token": token, "decision": rec, "label": meta["label"]})
+    return rec
+
+
+@router.get("/join/{token}")
+def join(token: str, request: Request):
+    rec = shares(request).join(token)
+    s = store(request).get(rec["session"])
+    if not s:
+        return error(410, "expired", "The editing session behind that link has ended.")
+    return {"sessionId": s.id, "name": s.name}
+
+
+# ── live presence ───────────────────────────────────────────────────────────
+
+
+@router.get("/sessions/{sid}/events")
+async def events(sid: str, request: Request, client: str = Query(..., min_length=4, max_length=40), name: str = ""):
+    s = session_of(request, sid)
+    color = share.COLORS[sum(map(ord, client)) % len(share.COLORS)]
+    who = {"name": share.clean_name(name), "color": color}
+    return StreamingResponse(share.stream(s.bus, client, who, {"rev": s.rev}), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+
+class PresenceBody(BaseModel):
+    client: str = Field(min_length=4, max_length=40)
+    name: str = Field(default="", max_length=60)
+    x: Optional[float] = None
+    y: Optional[float] = None
+    selection: list[str] = Field(default_factory=list, max_length=200)
+
+
+@router.post("/sessions/{sid}/presence", status_code=204)
+def presence(sid: str, body: PresenceBody, request: Request):
+    s = session_of(request, sid)
+    color = share.COLORS[sum(map(ord, body.client)) % len(share.COLORS)]
+    s.bus.publish("cursor", {"client": body.client, "name": share.clean_name(body.name), "color": color, "x": body.x, "y": body.y,
+                             "selection": body.selection[:200]}, exclude=body.client)
+    return None
+
+
+@router.get("/sessions/{sid}/people")
+def people(sid: str, request: Request):
+    return {"people": session_of(request, sid).bus.people()}

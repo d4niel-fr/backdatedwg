@@ -100,6 +100,9 @@ class EditorSession:
         self.previous: Optional[dict] = None  # what was remembered when this drawing was opened
         self.original_path: Optional[Path] = None  # the file as uploaded, for the proof pack
         self.original_name: Optional[str] = None
+        from .share import EventBus
+
+        self.bus = EventBus()  # live updates for everyone looking at this session
         self._original = zlib.compress(dump(doc).encode("utf-8"), 1)  # the drawing as opened, for "what changed since"
         self.name = name
         self.doc = doc
@@ -395,6 +398,9 @@ class EditorStore:
         self.root = root
         root.mkdir(parents=True, exist_ok=True)
         self.memory = MemoryStore(root / "_memory")
+        from .share import ShareStore
+
+        self.shares = ShareStore(root / "_shares")
         self.sessions: dict[str, EditorSession] = {}
         self._lock = threading.Lock()
         self._last_sweep = 0.0
@@ -442,6 +448,7 @@ class EditorStore:
         s = self.sessions.pop(sid, None)
         if not s:
             return False
+        self.shares.drop_session(sid)  # review links outlive the session; live editing links don't
         shutil.rmtree(s.dir, ignore_errors=True)
         return True
 
