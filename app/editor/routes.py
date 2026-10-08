@@ -57,7 +57,7 @@ def config(request: Request):
     model = _model(request)
     jobs = request.app.state.jobs
     return {
-        "ai": {"enabled": model is not None, "model": getattr(model, "name", None), "provider": "NVIDIA" if model is not None else None, "limit": AI_LIMIT},
+        "ai": {**llm.describe(model), "limit": AI_LIMIT, "vision": llm.vision_from_env() is not None},
         "canReadDwg": jobs.engines.can_read_dwg,
         "formats": [f for f in ("DWG", "DXF") if jobs.engines.can_write(f)],
         "maxUploadMB": MAX_UPLOAD // (1024 * 1024),

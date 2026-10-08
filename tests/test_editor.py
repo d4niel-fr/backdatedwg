@@ -456,6 +456,8 @@ class _Resp:
 
 
 def test_nvidia_client_request_and_think_stripping(monkeypatch):
+    for k in llm.KEY_NAMES:
+        monkeypatch.delenv(k, raising=False)
     seen = {}
 
     def fake_urlopen(req, timeout):
@@ -466,7 +468,7 @@ def test_nvidia_client_request_and_think_stripping(monkeypatch):
     monkeypatch.setenv("NVIDIA_API_KEY", "nvapi-secret")
     monkeypatch.setenv("NVIDIA_EXTRA_BODY", '{"top_p": 0.9}')
     model = llm.from_env()
-    assert model.name == llm.DEFAULT_MODEL
+    assert model.provider == "nvidia" and model.name == "nvidia/nemotron-3-ultra-550b-a55b"
     assert model.complete([{"role": "user", "content": "hi"}]) == '{"reply":"ok"}'
     assert seen["url"] == "https://integrate.api.nvidia.com/v1/chat/completions"
     assert seen["auth"] == "Bearer nvapi-secret" and seen["body"]["top_p"] == 0.9 and seen["body"]["stream"] is False
@@ -474,9 +476,11 @@ def test_nvidia_client_request_and_think_stripping(monkeypatch):
 
 def test_nvidia_client_errors_never_leak_the_key(monkeypatch):
     monkeypatch.setattr(llm.time, "sleep", lambda s: None)
+    for k in llm.KEY_NAMES:
+        monkeypatch.delenv(k, raising=False)
     monkeypatch.setenv("NVIDIA_API_KEY", "nvapi-secret")
     model = llm.from_env()
-    for status, needle in ((401, "rejected the API key"), (404, "doesn't know the model"), (400, "HTTP 400")):
+    for status, needle in ((401, "rejected the API key"), (404, "doesn't offer the model"), (400, "HTTP 400")):
         def boom(req, timeout, status=status):
             raise urllib.error.HTTPError(req.full_url, status, "x", {}, io.BytesIO(b"secret echo nvapi-secret"))
 
@@ -500,8 +504,8 @@ def test_nvidia_client_errors_never_leak_the_key(monkeypatch):
 
 
 def test_no_key_means_no_model(monkeypatch):
-    monkeypatch.delenv("NVIDIA_API_KEY", raising=False)
-    monkeypatch.delenv("NEMOTRON_API_KEY", raising=False)
+    for k in llm.KEY_NAMES:
+        monkeypatch.delenv(k, raising=False)
     assert llm.from_env() is None
 
 
@@ -515,7 +519,8 @@ def open_sample(client):
 
 
 def test_config_without_a_key(client, monkeypatch):
-    monkeypatch.delenv("NVIDIA_API_KEY", raising=False)
+    for k in llm.KEY_NAMES:
+        monkeypatch.delenv(k, raising=False)
     cfg = client.get("/api/editor/config").json()
     assert cfg["ai"]["enabled"] is False and cfg["formats"] == ["DXF"]
 
@@ -578,7 +583,7 @@ def test_chat_with_a_model(client):
     finally:
         del client.app.state.editor_llm
     assert chat["source"] == "model" and chat["proposal"]["stats"]["removed"] == 1 and chat["aiCallsLeft"] == 99
-    assert cfg["ai"] == {"enabled": True, "model": "fake", "provider": "NVIDIA", "limit": 100}
+    assert cfg["ai"]["enabled"] is True and cfg["ai"]["model"] == "fake" and cfg["ai"]["limit"] == 100
 
 
 def test_open_an_uploaded_dxf(client, sample_dxf):
