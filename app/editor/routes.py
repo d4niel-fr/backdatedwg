@@ -2,14 +2,17 @@
 
 from __future__ import annotations
 
+import json
 import os
+import queue
 import shutil
+import threading
 import uuid
 from pathlib import Path
 from typing import Optional
 
 from fastapi import APIRouter, FastAPI, File, Request, UploadFile
-from fastapi.responses import FileResponse, JSONResponse, Response
+from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field
 
 from .. import converter
@@ -17,6 +20,7 @@ from ..engines import CancelToken
 from ..jobs import Job
 from ..versions import BY_YEAR, TARGET_YEARS, DetectError, detect, order
 from . import agent, analysis, llm, ops, sample, standards
+from .memory import file_fingerprint
 from .session import AI_LIMIT, EditorError, EditorSession, EditorStore
 
 router = APIRouter(prefix="/api/editor")
@@ -109,13 +113,16 @@ def _open(request: Request, src: Path, name: str, det, work: Path):
     except converter.ConversionError as e:
         return error(422, e.code, e.message)
     label = f"{det.kind}, {det.version.label}" if det.version else det.kind
-    session = store(request).create(doc, name, notes, label)
+    session = store(request).create(doc, name, notes, label, fingerprint=file_fingerprint(src))
     return JSONResponse(session.summary(), status_code=201)
+
+
+SAMPLE_FINGERPRINT = "sample-warehouse-v1"
 
 
 @router.post("/sessions/sample", status_code=201)
 def open_sample(request: Request):
-    session = store(request).create(sample.build(), "Warehouse B (sample).dxf", [], "DXF, sample drawing")
+    session = store(request).create(sample.build(), "Warehouse B (sample).dxf", [], "DXF, sample drawing", fingerprint=SAMPLE_FINGERPRINT)
     return JSONResponse(session.summary(), status_code=201)
 
 
@@ -140,8 +147,9 @@ def geometry(sid: str, request: Request):
 
 
 class ChatBody(BaseModel):
-    message: str = Field(min_length=1, max_length=2000)
+    message: str = Field(min_length=1, max_length=8000)
     selection: list[str] = Field(default_factory=list, max_length=5000)
+    area: Optional[list[float]] = Field(default=None, min_length=4, max_length=4)
 
 
 class StageBody(BaseModel):
@@ -149,10 +157,7 @@ class StageBody(BaseModel):
     selection: list[str] = Field(default_factory=list, max_length=5000)
 
 
-@router.post("/sessions/{sid}/chat")
-def chat(sid: str, body: ChatBody, request: Request):
-    session = session_of(request, sid)
-    result = agent.run(session, body.message, body.selection, _model(request))
+def _chat_payload(session: EditorSession, body: ChatBody, result) -> dict:
     if result.source == "local":  # keep local exchanges in the model's memory too
         session.remember("user", body.message)
         session.remember("assistant", result.reply)
@@ -162,8 +167,60 @@ def chat(sid: str, body: ChatBody, request: Request):
         "error": result.error,
         "queries": result.queries,
         "proposal": result.proposal,
+        "data": result.data,
+        "suggestions": result.suggestions,
         "aiCallsLeft": max(0, AI_LIMIT - session.ai_calls),
     }
+
+
+@router.post("/sessions/{sid}/chat")
+def chat(sid: str, body: ChatBody, request: Request):
+    session = session_of(request, sid)
+    result = agent.run(session, body.message, body.selection, _model(request), area=body.area)
+    return _chat_payload(session, body, result)
+
+
+@router.post("/sessions/{sid}/chat/stream")
+def chat_stream(sid: str, body: ChatBody, request: Request):
+    """The same as /chat, as server-sent events: ``status`` lines while it works,
+    ``reply`` with the answer as it is written, then ``result`` (the /chat payload)."""
+    session = session_of(request, sid)
+    model = _model(request)
+    events: queue.Queue = queue.Queue()
+
+    def work() -> None:
+        try:
+            result = agent.run(session, body.message, body.selection, model, area=body.area,
+                               emit=lambda kind, data: events.put((kind, data)))
+            events.put(("result", _chat_payload(session, body, result)))
+        except Exception as e:  # noqa: BLE001 - reported to the page, never a hung stream
+            agent.log.exception("chat stream failed")
+            events.put(("error", {"message": f"Something went wrong: {e}"}))
+        finally:
+            events.put(None)
+
+    threading.Thread(target=work, daemon=True, name="chat-stream").start()
+
+    def stream():
+        yield ": stream open\n\n"
+        while True:
+            try:
+                item = events.get(timeout=15)
+            except queue.Empty:
+                yield ": keep-alive\n\n"
+                continue
+            if item is None:
+                return
+            kind, data = item
+            yield f"event: {kind}\ndata: {json.dumps(data, separators=(',', ':'))}\n\n"
+
+    return StreamingResponse(stream(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+
+@router.get("/sessions/{sid}/suggestions")
+def suggest(sid: str, request: Request, selected: int = 0):
+    session = session_of(request, sid)
+    return {"suggestions": agent.suggestions(session, ["x"] * max(0, min(selected, 1)))}
 
 
 @router.post("/sessions/{sid}/stage")
@@ -177,11 +234,16 @@ def stage(sid: str, body: StageBody, request: Request):
     return {"proposal": prop.view()}
 
 
+class AcceptBody(BaseModel):
+    steps: Optional[list[int]] = Field(default=None, max_length=50)
+
+
 @router.post("/sessions/{sid}/proposals/{pid}/accept")
-def accept(sid: str, pid: str, request: Request):
+def accept(sid: str, pid: str, request: Request, body: Optional[AcceptBody] = None):
     session = session_of(request, sid)
-    prop = session.accept(pid)
-    return {"proposal": {"id": prop.id, "status": prop.status}, "summary": session.summary()}
+    prop = session.accept(pid, steps=body.steps if body else None)
+    return {"proposal": {"id": prop.id, "status": prop.status, "summaries": prop.summaries},
+            "summary": session.summary(), "suggestions": agent.suggestions(session, [])}
 
 
 @router.post("/sessions/{sid}/proposals/{pid}/reject")
@@ -356,3 +418,25 @@ def standards_custom(sid: str, body: MappingBody, request: Request):
     except ops.OpError as e:
         return error(422, "bad_ops", str(e))
     return {"proposal": prop.view()}
+
+
+# ── memory ──────────────────────────────────────────────────────────────────
+
+
+@router.get("/sessions/{sid}/memory")
+def get_memory(sid: str, request: Request):
+    s = session_of(request, sid)
+    rec = store(request).memory.get(s.fingerprint)
+    if not rec:
+        return {"remembered": False}
+    return {"remembered": True, "visits": rec.get("visits", 0), "first": rec.get("first"), "last": rec.get("last"),
+            "changes": rec.get("changes", [])[-30:], "chat": rec.get("chat", [])[-12:]}
+
+
+@router.delete("/sessions/{sid}/memory", status_code=204)
+def forget_memory(sid: str, request: Request):
+    s = session_of(request, sid)
+    if s.fingerprint:
+        store(request).memory.forget(s.fingerprint)
+    s.previous = None
+    return None

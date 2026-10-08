@@ -63,6 +63,8 @@ class Proposal:
     preview_truncated: bool
     source: str
     prompt: Optional[str]
+    steps: list = field(default_factory=list)  # [{title, ops, summaries}]
+    why: str = ""
     status: str = "pending"  # pending | accepted | rejected | stale
     created: float = field(default_factory=time.time)
 
@@ -78,6 +80,8 @@ class Proposal:
             "stats": {"removed": len(t.deleted), "changed": len(t.changed), "added": len(t.created), "tables": t.tables},
             "preview": {"remove": self.preview_remove, "add": self.preview_add, "truncated": self.preview_truncated},
             "ops": self.ops,
+            "steps": [{"title": st["title"], "summaries": st["summaries"], "ops": st["ops"]} for st in self.steps],
+            "why": self.why,
         }
 
 
@@ -88,8 +92,12 @@ class EditorError(Exception):
 
 
 class EditorSession:
-    def __init__(self, sid: str, name: str, doc: Drawing, root: Path, notes: Optional[list[str]] = None, source_label: str = ""):
+    def __init__(self, sid: str, name: str, doc: Drawing, root: Path, notes: Optional[list[str]] = None, source_label: str = "",
+                 fingerprint: Optional[str] = None, memory=None):
         self.id = sid
+        self.fingerprint = fingerprint
+        self.memory = memory  # MemoryStore or None
+        self.previous: Optional[dict] = None  # what was remembered when this drawing was opened
         self.name = name
         self.doc = doc
         self.dir = root / sid
@@ -169,16 +177,46 @@ class EditorSession:
                 "log": self.log[-100:],
                 "aiCallsLeft": max(0, AI_LIMIT - self.ai_calls),
                 "docVersion": self.doc.dxfversion,
+                "fingerprint": self.fingerprint,
+                "memory": self.previous,
             }
 
     # ── proposals ─────────────────────────────────────────────────────────
-    def stage(self, op_list: list, selection: list[str], source: str, prompt: Optional[str] = None) -> Proposal:
-        """Apply ``op_list`` to a copy and describe the result. Raises ops.OpError."""
+    def _apply_steps(self, clone: Drawing, steps: list, selection: list[str]) -> tuple[ops.Applied, list]:
+        """Run each step's operations in order on ``clone``; one combined result."""
+        combined = ops.Applied()
+        done = []
+        for i, st in enumerate(steps, 1):
+            try:
+                res = ops.apply_ops(clone, st["ops"], self.units(), selection, self.text_height())
+            except ops.OpError as e:
+                raise ops.OpError(f"Step {i} ({st['title']}): {e}") from e
+            done.append({"title": st["title"], "ops": st["ops"], "summaries": res.summaries})
+            combined.summaries += res.summaries
+            combined.warnings += res.warnings
+            t, r = combined.touched, res.touched
+            gone_new = r.deleted & t.created  # made earlier in this proposal, removed now
+            t.created = (t.created - r.deleted) | r.created
+            t.changed = (t.changed | r.changed) - r.deleted
+            t.deleted |= r.deleted - gone_new
+            t.tables = t.tables or r.tables
+        return combined, done
+
+    def stage(self, op_list: list, selection: list[str], source: str, prompt: Optional[str] = None,
+              steps: Optional[list] = None, why: str = "") -> Proposal:
+        """Apply the operations (or named steps of operations) to a copy and describe the result. Raises ops.OpError."""
+        if steps:
+            steps = _clean_steps(steps)
+            op_list = [o for st in steps for o in st["ops"]]
+        else:
+            steps = [{"title": "", "ops": op_list}]
         with self.lock:
             before = dump(self.doc)
             clone = parse(before)
-            result = ops.apply_ops(clone, op_list, self.units(), selection, self.text_height())
+            result, done = self._apply_steps(clone, steps, selection)
             t = result.touched
+            if not result.summaries:
+                raise ops.OpError("There's nothing to change: " + "; ".join(result.warnings)[:300] if result.warnings else "There's nothing to change.")
             fresh = geometry.extract(clone, handles=t.changed | t.created).items if (t.changed or t.created) else []
             remove = sorted(t.deleted | t.changed)
             truncated = len(fresh) > PREVIEW_LIMIT
@@ -196,7 +234,10 @@ class EditorSession:
                 preview_truncated=truncated or len(remove) > PREVIEW_LIMIT,
                 source=source,
                 prompt=prompt,
+                steps=done if len(done) > 1 or done[0]["title"] else [],
+                why=why,
             )
+            prop.selection = list(selection)  # type: ignore[attr-defined]
             pending = [p for p in self.proposals.values() if p.status == "pending"]
             for old in pending[: max(0, len(pending) - (MAX_PENDING - 1))]:
                 old.status = "stale"
@@ -210,7 +251,8 @@ class EditorSession:
             raise EditorError(404, "not_found", "That proposal doesn't exist any more.")
         return p
 
-    def accept(self, pid: str) -> Proposal:
+    def accept(self, pid: str, steps: Optional[list[int]] = None) -> Proposal:
+        """Commit a proposal. With ``steps`` (indexes), only those steps of a multi-step plan are applied."""
         with self.lock:
             p = self._proposal(pid)
             if p.status != "pending":
@@ -218,6 +260,16 @@ class EditorSession:
             if p.base_rev != self.rev:
                 p.status = "stale"
                 raise EditorError(409, "stale", "The drawing changed after this was proposed. Ask again to get a fresh proposal.")
+            if steps is not None and p.steps and sorted(set(steps)) != list(range(len(p.steps))):
+                chosen = [p.steps[i] for i in sorted(set(steps)) if 0 <= i < len(p.steps)]
+                if not chosen:
+                    raise EditorError(400, "no_steps", "Choose at least one step to apply.")
+                clone = parse(p.before_text)
+                try:
+                    result, done = self._apply_steps(clone, chosen, getattr(p, "selection", []))
+                except ops.OpError as e:
+                    raise EditorError(409, "step_failed", f"Those steps can't be applied on their own: {e}") from e
+                p.doc, p.steps, p.summaries = clone, done, result.summaries
             self._push(self.undo_stack, "; ".join(p.summaries)[:200], p.before_text)
             self.redo_stack.clear()
             self.doc = p.doc
@@ -230,6 +282,8 @@ class EditorSession:
                     other.status = "stale"
                     other.doc = None  # type: ignore[assignment]
             self.log.append({"rev": self.rev, "time": int(time.time()), "summaries": p.summaries, "prompt": p.prompt, "source": p.source})
+            if self.memory is not None:
+                self.memory.add_change(self.fingerprint, p.summaries, p.prompt)
             return p
 
     def reject(self, pid: str) -> Proposal:
@@ -284,17 +338,56 @@ class EditorSession:
                 for old in self.dir.glob("rev*.dxf"):
                     old.unlink(missing_ok=True)
                 self.doc.saveas(path)
+                if self.memory is not None and self.fingerprint:
+                    from .memory import file_fingerprint
+
+                    self.memory.alias(file_fingerprint(path), self.fingerprint)  # reopening the edited copy remembers too
             return path
+
+    def index(self) -> dict:
+        """Searchable summary: layers, blocks and (many more) labels than the digest keeps."""
+        from .memory import index_of
+
+        idx = index_of(self.digest())
+        seen: list[str] = []
+        for it in self.scene().items:
+            if it["k"] == "t":
+                t = " ".join(it["v"].split())[:80]
+                if t and t not in seen:
+                    seen.append(t)
+                    if len(seen) >= 500:
+                        break
+        idx["texts"] = seen
+        return idx
 
     def remember(self, role: str, content: str) -> None:
         self.chat.append({"role": role, "content": content[:4000]})
         del self.chat[:-40]
+        if role == "assistant" and self.memory is not None and len(self.chat) >= 2 and self.chat[-2]["role"] == "user":
+            self.memory.add_chat(self.fingerprint, self.chat[-2]["content"], content)
+
+
+MAX_STEPS = 8
+
+
+def _clean_steps(steps) -> list:
+    if not isinstance(steps, list) or not 1 <= len(steps) <= MAX_STEPS:
+        raise ops.OpError(f"A plan must have 1 to {MAX_STEPS} steps.")
+    out = []
+    for i, st in enumerate(steps, 1):
+        if not isinstance(st, dict) or not isinstance(st.get("ops"), list) or not st["ops"]:
+            raise ops.OpError(f"Step {i} must be an object with a non-empty 'ops' list.")
+        out.append({"title": str(st.get("title") or f"Step {i}")[:120], "ops": st["ops"]})
+    return out
 
 
 class EditorStore:
     def __init__(self, root: Path):
+        from .memory import MemoryStore
+
         self.root = root
         root.mkdir(parents=True, exist_ok=True)
+        self.memory = MemoryStore(root / "_memory")
         self.sessions: dict[str, EditorSession] = {}
         self._lock = threading.Lock()
         self._last_sweep = 0.0
@@ -304,21 +397,27 @@ class EditorStore:
         now = time.time()
         for d in self.root.iterdir():
             try:
-                if d.is_dir() and now - d.stat().st_mtime >= RETENTION_SECONDS:
+                if d.is_dir() and not d.name.startswith("_") and now - d.stat().st_mtime >= RETENTION_SECONDS:
                     shutil.rmtree(d, ignore_errors=True)
             except OSError:
                 pass
 
-    def create(self, doc: Drawing, name: str, notes: Optional[list[str]] = None, source_label: str = "") -> EditorSession:
+    def create(self, doc: Drawing, name: str, notes: Optional[list[str]] = None, source_label: str = "",
+               fingerprint: Optional[str] = None) -> EditorSession:
         self.sweep()
         with self._lock:
             while len(self.sessions) >= MAX_SESSIONS:
                 oldest = min(self.sessions.values(), key=lambda s: s.touched)
                 self._drop(oldest.id)
             sid = uuid.uuid4().hex
-            session = EditorSession(sid, name, doc, self.root, notes, source_label)
+            session = EditorSession(sid, name, doc, self.root, notes, source_label, fingerprint, self.memory)
             self.sessions[sid] = session
-            return session
+        if fingerprint:
+            try:
+                session.previous = self.memory.visit(fingerprint, name, session.index())
+            except (OSError, ValueError):
+                log.warning("couldn't record drawing memory", exc_info=True)
+        return session
 
     def get(self, sid: str) -> Optional[EditorSession]:
         self.sweep()

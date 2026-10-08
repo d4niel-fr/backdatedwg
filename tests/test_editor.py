@@ -415,17 +415,17 @@ def test_model_prose_json_fences_and_think_tags_are_tolerated(session):
 
 
 def test_llm_errors_and_limits_are_reported_not_raised(session, monkeypatch):
-    r = agent.run(session, "tidy up", [], FakeModel(llm.LLMError("The AI service is busy right now.")))
+    r = agent.run(session, "rearrange the racks more nicely", [], FakeModel(llm.LLMError("The AI service is busy right now.")))
     assert r.error == "llm" and "busy" in r.reply
     monkeypatch.setattr(agent, "AI_LIMIT", 0)
-    r = agent.run(session, "tidy up", [], FakeModel("never called"))
+    r = agent.run(session, "rearrange the racks more nicely", [], FakeModel("never called"))
     assert r.error == "ai_limit"
 
 
 def test_selection_is_described_to_the_model(session):
     h = session.doc.modelspace().query("CIRCLE")[0].dxf.handle
     model = FakeModel({"reply": "That is a circle.", "queries": [], "ops": []})
-    agent.run(session, "what is this?", [h], model)
+    agent.run(session, "could this be moved closer to the wall?", [h], model)
     system = model.calls[0][0]["content"]
     assert "1 entities selected" in system and h in system
 
