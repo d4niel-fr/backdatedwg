@@ -18,7 +18,7 @@ from fastapi.staticfiles import StaticFiles
 from .editor.routes import install as install_editor
 from .editor.session import EditorStore
 from .engines import Engines
-from .jobs import RETENTION_SECONDS, Job, JobManager, file_info
+from .jobs import EDITOR_SUBDIR, RETENTION_SECONDS, Job, JobManager, file_info
 from .versions import BY_YEAR, DEFAULT_TARGET_YEAR, TARGET_YEARS, DetectError, detect, order
 
 logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"))
@@ -36,9 +36,10 @@ async def lifespan(app: FastAPI):
     engines = Engines.discover()
     logging.getLogger("backdate").info("engines: %s", engines.describe())
     app.state.jobs = JobManager(DATA_DIR, engines)
-    # The AI editor keeps its sessions beside the jobs, not inside the folder
-    # the job sweeper cleans.
-    app.state.editor = EditorStore(DATA_DIR.parent / (DATA_DIR.name + "-editor"))
+    # The AI editor keeps its sessions in DATA_DIR/_editor: inside the data
+    # folder (the only place the Docker user can write), in a "_" folder the
+    # job sweeper leaves alone.
+    app.state.editor = EditorStore(Path(os.environ.get("BACKDATE_EDITOR_DIR") or DATA_DIR / EDITOR_SUBDIR))
     yield
     app.state.jobs.shutdown()
 

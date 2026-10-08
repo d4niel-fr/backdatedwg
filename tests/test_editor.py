@@ -653,3 +653,13 @@ def test_text_inside_a_drawing_cannot_issue_commands(session):
     assert r.proposal["status"] == "pending"           # staged, not applied
     assert len(session.doc.modelspace()) == 7 and session.rev == 0
     assert "IGNORE ALL RULES" in model.calls[0][0]["content"] and "untrusted file" in model.calls[0][0]["content"]
+
+
+def test_editor_folder_lives_in_the_data_dir_and_survives_the_job_sweeper(client, tmp_path):
+    """Docker runs as a user who can write only to DATA_DIR; a sibling folder failed startup."""
+    root = client.app.state.editor.root
+    jobs = client.app.state.jobs
+    assert root.parent == jobs.root and root.name == "_editor"
+    sid = open_sample(client)["id"]
+    jobs.sweep(now=10**12)  # far future: every unknown job folder is stale
+    assert root.exists() and client.get(f"/api/editor/sessions/{sid}").status_code == 200
