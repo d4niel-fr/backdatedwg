@@ -48,6 +48,50 @@ uvicorn app.main:app --port 8000
 
 To convert DWG files, install ODA File Converter (it's found on `PATH`, in its standard install folders, or through `ODA_CONVERTER_PATH`). On a headless Linux server you also need `xvfb` (`xvfb-run`). LibreDWG's `dwg2dxf` on `PATH` is used as a fallback DWG reader.
 
+## AI editor (beta)
+
+`/editor.html` opens a drawing next to a chat, so you can edit it by asking. It is a separate feature: the converter above is unchanged, and the editor only reuses its file reader and its export queue.
+
+1. **Open** a DWG or DXF (or try the built-in sample warehouse). DWG needs ODA File Converter or LibreDWG on the server, like the converter.
+2. **Ask**: "move layer S-RACK 2 m east", "rename layer TEMP to NOTES", "replace "REV A" with "REV B"", "purge unused layers", or, with the AI connected, open-ended requests such as "tidy this up". Click things on the drawing first (click, Shift-click, or drag a box: left-to-right must enclose, right-to-left touches) and say what to do with them.
+3. **Review.** Nothing is applied yet. The drawing shows what would be removed or moved (dashed orange) and where it ends up (green), and the chat lists the changes in words, with the exact operations one click away.
+4. **Accept or reject.** Accepted changes go on an undo/redo history and a change log.
+5. **Save** as DXF, or as an older release (DWG with ODA), through the same conversion and report as the converter.
+
+How the AI is kept safe: the model never edits the file. It sees a summary of the drawing (units, size, layers, block names, text labels) and can ask questions through read-only queries. To change anything it must answer with operations from a fixed list (`move`, `copy`, `array`, `rotate`, `scale`, `delete`, `set_layer`, `set_color`, `create_layer`, `layer_props`, `rename_layer`, `purge_unused_layers`, `add_line`/`add_polyline`/`add_rect`/`add_circle`/`add_text`, `replace_text`). Each is validated and run on a *copy* of the drawing, and only a person pressing Accept commits it. Text inside the drawing is treated as data, never as instructions. A plain-command parser answers first, so common requests are instant, free and work without any key.
+
+### Connecting the AI (NVIDIA Nemotron)
+
+| Variable | Default | |
+| --- | --- | --- |
+| `NVIDIA_API_KEY` | none | Key from build.nvidia.com. **Without it the editor still works with the built-in commands.** Keep it in the host's secret store, never in the repo. |
+| `NEMOTRON_MODEL` | `nvidia/nemotron-3-ultra-550b-a55b` | Copy the exact id from the model card if it differs. |
+| `NVIDIA_BASE_URL` | `https://integrate.api.nvidia.com/v1` | Any OpenAI-compatible server works, for example a self-hosted vLLM, so drawings never leave your network. |
+| `NVIDIA_EXTRA_BODY` | none | JSON merged into each request, for model-specific switches. |
+| `NVIDIA_TIMEOUT` | `120` | Seconds to wait for one model call. |
+| `BACKDATE_EDITOR_AI_LIMIT` | `100` | Model calls per editing session. |
+| `BACKDATE_EDITOR_MAX_SESSIONS` | `20` | Open drawings kept in memory. |
+
+With the AI on, a message and a summary of the drawing (layers, counts, text labels, never the file) go to the AI service. The editor page says so.
+
+Limits for now: sessions live in memory for an hour (single server process, like the converter's jobs); model space only; hatches, images and points are not drawn in the viewer (they are kept in the file); very large drawings preview partially; replies arrive whole, not streamed. It needs the server, so it does not work on the static in-browser build.
+
+### Editor API
+
+| Method | Path | |
+| --- | --- | --- |
+| `GET` | `/api/editor/config` | Whether the AI is connected, formats, targets |
+| `POST` | `/api/editor/sessions` | Multipart `file`. Opens a drawing; returns the session summary |
+| `POST` | `/api/editor/sessions/sample` | Opens the sample warehouse |
+| `GET` / `DELETE` | `/api/editor/sessions/{id}` | Summary (digest, history, change log) / close |
+| `GET` | `/api/editor/sessions/{id}/geometry` | The drawing as polylines and text for the viewer |
+| `POST` | `/api/editor/sessions/{id}/chat` | `{message, selection[]}`. Returns a reply and optionally a proposal |
+| `POST` | `/api/editor/sessions/{id}/stage` | `{ops[]}`. Propose operations directly, without a model |
+| `POST` | `/api/editor/sessions/{id}/proposals/{pid}/accept` or `/reject` | Decide |
+| `POST` | `/api/editor/sessions/{id}/undo` or `/redo` | History |
+| `GET` | `/api/editor/sessions/{id}/download.dxf` | The edited drawing as DXF |
+| `POST` | `/api/editor/sessions/{id}/export` | `{target, format}`. Starts a normal conversion job (poll `/api/jobs/{id}`) |
+
 ## What each engine can do
 
 | Setup | DWG in | DXF in | DWG out | DXF out |
@@ -113,6 +157,7 @@ The tests cover version detection, the fallback downgrade, every error path, can
 
 ```
 app/
+  editor/       AI editor: geometry, operations, sessions, agent, NVIDIA client, routes
   main.py       HTTP API + static files
   jobs.py       job queue, progress/ETA, cancel, 1-hour cleanup
   converter.py  read → convert → write → report pipeline

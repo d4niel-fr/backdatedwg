@@ -1,0 +1,665 @@
+"""The vocabulary of edits, and the code that carries them out.
+
+An operation is a small JSON object: ``{"op": "move", "selector": {...}, "dx": "2m"}``.
+The model can ask for nothing outside this list. Each operation is validated,
+applied to a copy of the drawing, and reported as sentences a person can read
+before anything is committed.
+"""
+
+from __future__ import annotations
+
+import fnmatch
+import math
+import re
+from dataclasses import dataclass, field
+from typing import Callable, Iterable, Optional
+
+from ezdxf import bbox
+from ezdxf.document import Drawing
+from ezdxf.lldxf.const import DXFError
+from ezdxf.math import Matrix44
+
+from .units import UnitError, Units
+
+MAX_AFFECTED = 20_000
+WARN_AFFECTED = 500
+MAX_ARRAY = 1_000
+
+TYPE_ALIASES: dict[str, set[str]] = {
+    "line": {"LINE"},
+    "polyline": {"LWPOLYLINE", "POLYLINE"},
+    "lwpolyline": {"LWPOLYLINE"},
+    "circle": {"CIRCLE"},
+    "arc": {"ARC"},
+    "ellipse": {"ELLIPSE"},
+    "spline": {"SPLINE"},
+    "text": {"TEXT", "MTEXT"},
+    "mtext": {"MTEXT"},
+    "block": {"INSERT"},
+    "insert": {"INSERT"},
+    "dimension": {"DIMENSION"},
+    "hatch": {"HATCH"},
+    "point": {"POINT"},
+    "leader": {"LEADER", "MULTILEADER"},
+    "solid": {"SOLID"},
+}
+
+COLOR_NAMES = {"red": 1, "yellow": 2, "green": 3, "cyan": 4, "blue": 5, "magenta": 6, "white": 7, "black": 7, "grey": 8, "gray": 8, "orange": 30}
+PROTECTED_LAYERS = {"0", "defpoints"}
+SELECTOR_KEYS = {"handles", "layer", "type", "text", "color", "block", "bbox", "selection", "all"}
+
+
+class OpError(ValueError):
+    """An operation that can't be carried out. The message is written for the model and for people."""
+
+
+@dataclass
+class Touched:
+    changed: set[str] = field(default_factory=set)
+    deleted: set[str] = field(default_factory=set)
+    created: set[str] = field(default_factory=set)
+    tables: bool = False  # layers or other tables changed
+
+
+@dataclass
+class Applied:
+    summaries: list[str] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
+    touched: Touched = field(default_factory=Touched)
+
+
+@dataclass
+class Ctx:
+    doc: Drawing
+    units: Units
+    selection: list[str]
+    text_height: float
+    out: Applied
+
+    @property
+    def msp(self):
+        return self.doc.modelspace()
+
+    def length(self, value, what: str) -> float:
+        try:
+            return self.units.length(value)
+        except UnitError as e:
+            raise OpError(f"{what}: {e}") from e
+
+    def show(self, value: float) -> str:
+        return self.units.show(value)
+
+
+# ── selectors ───────────────────────────────────────────────────────────────
+
+
+def _as_list(v) -> list:
+    return list(v) if isinstance(v, (list, tuple, set)) else [v]
+
+
+def _color_index(value, what="color") -> int:
+    if isinstance(value, bool):
+        raise OpError(f"{what}: expected a colour name or AutoCAD colour number 1-255.")
+    if isinstance(value, (int, float)) and 0 < int(value) <= 255:
+        return int(value)
+    if isinstance(value, str):
+        v = value.strip().lower()
+        if v in COLOR_NAMES:
+            return COLOR_NAMES[v]
+        if v.isdigit() and 0 < int(v) <= 255:
+            return int(v)
+    raise OpError(f"{what}: {value!r} isn't a colour. Use a name ({', '.join(sorted(COLOR_NAMES))}) or a number 1-255.")
+
+
+def resolve(ctx: Ctx, selector, *, what: str = "selector") -> list:
+    """The model-space entities a selector matches. Never empty: no match is an error."""
+    if selector == "selection":
+        selector = {"selection": True}
+    if isinstance(selector, list):
+        selector = {"handles": selector}
+    if not isinstance(selector, dict):
+        raise OpError(f"{what} must be an object like {{\"layer\": \"A-WALL\"}}.")
+    extra = set(selector) - SELECTOR_KEYS
+    if extra:
+        raise OpError(f"{what} has unknown keys {sorted(extra)}. Allowed: {sorted(SELECTOR_KEYS)}.")
+    filters = {k: v for k, v in selector.items() if k != "all" and v not in (None, False, "", [])}
+    if not filters and not selector.get("all"):
+        raise OpError(f"{what} would match every entity. Give at least one filter (layer, type, handles, text, bbox) or {{\"all\": true}}.")
+
+    handles: Optional[set[str]] = None
+    if "handles" in filters:
+        handles = {str(h).upper() for h in _as_list(filters["handles"])}
+    if filters.get("selection"):
+        sel = {h.upper() for h in ctx.selection}
+        if not sel:
+            raise OpError("Nothing is selected. Click something in the drawing first, or describe what to change.")
+        handles = sel if handles is None else handles & sel
+
+    layers = [str(x).lower() for x in _as_list(filters["layer"])] if "layer" in filters else None
+    types: Optional[set[str]] = None
+    if "type" in filters:
+        types = set()
+        for t in _as_list(filters["type"]):
+            key = str(t).strip().lower()
+            types |= TYPE_ALIASES.get(key, {key.upper()})
+    needle = str(filters["text"]).lower() if "text" in filters else None
+    aci = _color_index(filters["color"]) if "color" in filters else None
+    blocks = [str(b).lower() for b in _as_list(filters["block"])] if "block" in filters else None
+    box = None
+    if "bbox" in filters:
+        b = filters["bbox"]
+        if not isinstance(b, (list, tuple)) or len(b) != 4:
+            raise OpError(f"{what}.bbox must be [xmin, ymin, xmax, ymax].")
+        x0, y0, x1, y1 = (ctx.length(v, f"{what}.bbox") for v in b)
+        box = (min(x0, x1), min(y0, y1), max(x0, x1), max(y0, y1))
+
+    found = []
+    for e in ctx.msp:
+        if handles is not None and e.dxf.handle.upper() not in handles:
+            continue
+        kind = e.dxftype()
+        if types is not None and kind not in types:
+            continue
+        if layers is not None and not any(fnmatch.fnmatchcase(e.dxf.get("layer", "0").lower(), p) for p in layers):
+            continue
+        if aci is not None and e.dxf.get("color", 256) != aci:
+            continue
+        if blocks is not None and (kind != "INSERT" or not any(fnmatch.fnmatchcase(e.dxf.get("name", "").lower(), p) for p in blocks)):
+            continue
+        if needle is not None and needle not in _entity_text(e).lower():
+            continue
+        if box is not None and not _in_box(e, box):
+            continue
+        found.append(e)
+        if len(found) > MAX_AFFECTED:
+            raise OpError(f"{what} matches more than {MAX_AFFECTED:,} entities. Narrow it down.")
+    if not found:
+        raise OpError(f"{what} matched no entities ({_describe(selector)}). Check the layer names, types and text against the drawing summary.")
+    if len(found) > WARN_AFFECTED:
+        ctx.out.warnings.append(f"A selector matched {len(found):,} entities.")
+    return found
+
+
+def _entity_text(e) -> str:
+    kind = e.dxftype()
+    try:
+        if kind == "MTEXT":
+            return e.plain_text()
+        if kind == "TEXT":
+            return e.dxf.get("text", "")
+        if kind == "INSERT":
+            return " ".join(a.dxf.get("text", "") for a in e.attribs)
+    except Exception:  # noqa: BLE001
+        return ""
+    return ""
+
+
+def _in_box(e, box) -> bool:
+    try:
+        ext = bbox.extents([e], fast=True)
+    except Exception:  # noqa: BLE001
+        return False
+    if not ext.has_data:
+        return False
+    return not (ext.extmax.x < box[0] or ext.extmin.x > box[2] or ext.extmax.y < box[1] or ext.extmin.y > box[3])
+
+
+def _describe(selector: dict) -> str:
+    parts = [f"{k}={v!r}" for k, v in selector.items() if v not in (None, False, "", [])]
+    return ", ".join(parts)[:160] or "all"
+
+
+_NAMES = {"INSERT": ("block reference", "block references"), "LWPOLYLINE": ("polyline", "polylines"), "MTEXT": ("text", "text items"), "TEXT": ("text", "text items")}
+
+
+def _noun(entities: list, ctx: Ctx) -> str:
+    n = len(entities)
+    layers = {e.dxf.get("layer", "0") for e in entities}
+    types = {e.dxftype() for e in entities}
+    if len(types) == 1:
+        kind = next(iter(types))
+        one, many = _NAMES.get(kind, (kind.lower(), kind.lower() + "s"))
+    else:
+        one, many = "entity", "entities"
+    where = f" on layer {next(iter(layers))}" if len(layers) == 1 else f" on {len(layers)} layers"
+    return f"{n:,} {one if n == 1 else many}{where}"
+
+
+# ── transforms ──────────────────────────────────────────────────────────────
+
+
+def _transform(ctx: Ctx, entities: list, matrix: Matrix44) -> int:
+    done = skipped = 0
+    for e in entities:
+        try:
+            e.transform(matrix)
+            ctx.out.touched.changed.add(e.dxf.handle)
+            done += 1
+        except (NotImplementedError, TypeError, DXFError, AttributeError, ArithmeticError):
+            skipped += 1
+    if skipped:
+        ctx.out.warnings.append(f"{skipped:,} entities couldn't be transformed (unsupported type) and were left alone.")
+    if not done:
+        raise OpError("None of the selected entities can be transformed.")
+    return done
+
+
+def _centre(entities: list) -> tuple[float, float]:
+    ext = bbox.extents(entities, fast=True)
+    if not ext.has_data:
+        return 0.0, 0.0
+    return (ext.extmin.x + ext.extmax.x) / 2, (ext.extmin.y + ext.extmax.y) / 2
+
+
+def _pivot(ctx: Ctx, args: dict, entities: list) -> tuple[float, float]:
+    if args.get("cx") is not None or args.get("cy") is not None:
+        cx, cy = _centre(entities)
+        return (ctx.length(args["cx"], "cx") if args.get("cx") is not None else cx,
+                ctx.length(args["cy"], "cy") if args.get("cy") is not None else cy)
+    return _centre(entities)
+
+
+def _number(args: dict, key: str, what: str, *, default=None) -> float:
+    v = args.get(key, default)
+    if isinstance(v, bool) or not isinstance(v, (int, float, str)):
+        raise OpError(f"{what}: '{key}' must be a number.")
+    try:
+        f = float(v)
+    except ValueError as e:
+        raise OpError(f"{what}: '{key}' must be a number, got {v!r}.") from e
+    if not math.isfinite(f):
+        raise OpError(f"{what}: '{key}' must be finite.")
+    return f
+
+
+# ── operations ──────────────────────────────────────────────────────────────
+
+OPS: dict[str, "OpSpec"] = {}
+
+
+@dataclass
+class OpSpec:
+    name: str
+    fn: Callable[[Ctx, dict], None]
+    keys: set[str]
+    doc: str
+
+
+def op(name: str, keys: Iterable[str], doc: str):
+    def deco(fn):
+        OPS[name] = OpSpec(name, fn, set(keys), doc)
+        return fn
+
+    return deco
+
+
+@op("move", ["selector", "dx", "dy"], 'move(selector, dx, dy)  shift entities. Distances are numbers in drawing units or strings like "2m", "500mm". +x is right/east, +y is up/north.')
+def _move(ctx: Ctx, a: dict) -> None:
+    ents = resolve(ctx, a.get("selector"))
+    dx = ctx.length(a.get("dx", 0), "dx")
+    dy = ctx.length(a.get("dy", 0), "dy")
+    if dx == 0 and dy == 0:
+        raise OpError("move: give a non-zero dx or dy.")
+    n = _transform(ctx, ents, Matrix44.translate(dx, dy, 0))
+    ctx.out.summaries.append(f"Move {_noun(ents, ctx)} by ({ctx.show(dx)}, {ctx.show(dy)})" if n == len(ents) else f"Move {n:,} entities by ({ctx.show(dx)}, {ctx.show(dy)})")
+
+
+def _copy_entities(ctx: Ctx, ents: list, matrix: Matrix44) -> int:
+    made = 0
+    for e in ents:
+        try:
+            c = e.copy()
+            ctx.msp.add_entity(c)
+            c.transform(matrix)
+            ctx.out.touched.created.add(c.dxf.handle)
+            made += 1
+        except (NotImplementedError, TypeError, DXFError, AttributeError):
+            continue
+    return made
+
+
+@op("copy", ["selector", "dx", "dy"], "copy(selector, dx, dy)  duplicate entities, offset by dx, dy.")
+def _copy(ctx: Ctx, a: dict) -> None:
+    ents = resolve(ctx, a.get("selector"))
+    dx, dy = ctx.length(a.get("dx", 0), "dx"), ctx.length(a.get("dy", 0), "dy")
+    made = _copy_entities(ctx, ents, Matrix44.translate(dx, dy, 0))
+    if not made:
+        raise OpError("copy: none of the selected entities can be copied.")
+    ctx.out.summaries.append(f"Copy {_noun(ents, ctx)} by ({ctx.show(dx)}, {ctx.show(dy)})")
+
+
+@op("array", ["selector", "count", "dx", "dy"], "array(selector, count, dx, dy)  make `count` extra copies, each offset a further dx, dy from the last.")
+def _array(ctx: Ctx, a: dict) -> None:
+    ents = resolve(ctx, a.get("selector"))
+    count = int(_number(a, "count", "array"))
+    if not 1 <= count <= MAX_ARRAY:
+        raise OpError(f"array: count must be between 1 and {MAX_ARRAY}.")
+    if len(ents) * count > MAX_AFFECTED:
+        raise OpError(f"array: that would create more than {MAX_AFFECTED:,} entities.")
+    dx, dy = ctx.length(a.get("dx", 0), "dx"), ctx.length(a.get("dy", 0), "dy")
+    if dx == 0 and dy == 0:
+        raise OpError("array: give a non-zero dx or dy.")
+    total = 0
+    for i in range(1, count + 1):
+        total += _copy_entities(ctx, ents, Matrix44.translate(dx * i, dy * i, 0))
+    if not total:
+        raise OpError("array: none of the selected entities can be copied.")
+    ctx.out.summaries.append(f"Array {_noun(ents, ctx)} ×{count} at ({ctx.show(dx)}, {ctx.show(dy)}) steps")
+
+
+@op("rotate", ["selector", "angle", "cx", "cy"], "rotate(selector, angle, cx?, cy?)  rotate by `angle` degrees anticlockwise about (cx, cy), default the selection's centre.")
+def _rotate(ctx: Ctx, a: dict) -> None:
+    ents = resolve(ctx, a.get("selector"))
+    angle = _number(a, "angle", "rotate")
+    if angle % 360 == 0:
+        raise OpError("rotate: angle is zero (or a full turn).")
+    cx, cy = _pivot(ctx, a, ents)
+    m = Matrix44.chain(Matrix44.translate(-cx, -cy, 0), Matrix44.z_rotate(math.radians(angle)), Matrix44.translate(cx, cy, 0))
+    _transform(ctx, ents, m)
+    ctx.out.summaries.append(f"Rotate {_noun(ents, ctx)} by {angle:g}°")
+
+
+@op("scale", ["selector", "factor", "cx", "cy"], "scale(selector, factor, cx?, cy?)  uniform scale about (cx, cy), default the selection's centre.")
+def _scale(ctx: Ctx, a: dict) -> None:
+    ents = resolve(ctx, a.get("selector"))
+    f = _number(a, "factor", "scale")
+    if not 1e-4 <= f <= 1e4:
+        raise OpError("scale: factor must be between 0.0001 and 10000.")
+    if f == 1:
+        raise OpError("scale: factor 1 changes nothing.")
+    cx, cy = _pivot(ctx, a, ents)
+    m = Matrix44.chain(Matrix44.translate(-cx, -cy, 0), Matrix44.scale(f, f, f), Matrix44.translate(cx, cy, 0))
+    _transform(ctx, ents, m)
+    ctx.out.summaries.append(f"Scale {_noun(ents, ctx)} by {f:g}×")
+
+
+@op("delete", ["selector"], "delete(selector)  remove entities.")
+def _delete(ctx: Ctx, a: dict) -> None:
+    ents = resolve(ctx, a.get("selector"))
+    noun = _noun(ents, ctx)  # describe them while they still exist
+    for e in ents:
+        h = e.dxf.handle
+        ctx.msp.delete_entity(e)
+        ctx.out.touched.deleted.add(h)
+    ctx.out.summaries.append(f"Delete {noun}")
+
+
+def _ensure_layer(ctx: Ctx, name: str) -> None:
+    if not ctx.doc.layers.has_entry(name):
+        ctx.doc.layers.add(name)
+        ctx.out.touched.tables = True
+
+
+def _layer_name(value, what: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise OpError(f"{what}: layer name must be a non-empty string.")
+    name = value.strip()
+    if re.search(r'[<>/\\":;?*|=`]', name) or len(name) > 255:
+        raise OpError(f"{what}: {name!r} isn't a valid layer name.")
+    return name
+
+
+@op("set_layer", ["selector", "layer"], "set_layer(selector, layer)  move entities onto a layer (created if it doesn't exist).")
+def _set_layer(ctx: Ctx, a: dict) -> None:
+    ents = resolve(ctx, a.get("selector"))
+    name = _layer_name(a.get("layer"), "set_layer")
+    _ensure_layer(ctx, name)
+    n = 0
+    for e in ents:
+        if e.dxf.get("layer", "0") != name:
+            e.dxf.layer = name
+            ctx.out.touched.changed.add(e.dxf.handle)
+            n += 1
+    if not n:
+        raise OpError(f"set_layer: everything selected is already on layer {name}.")
+    ctx.out.summaries.append(f"Move {n:,} entities to layer {name}")
+
+
+@op("set_color", ["selector", "color"], 'set_color(selector, color)  colour name or number 1-255, or "bylayer".')
+def _set_color(ctx: Ctx, a: dict) -> None:
+    ents = resolve(ctx, a.get("selector"))
+    c = a.get("color")
+    by_layer = isinstance(c, str) and c.strip().lower() in ("bylayer", "by layer")
+    idx = 256 if by_layer else _color_index(c)
+    for e in ents:
+        e.dxf.color = idx
+        if e.dxf.hasattr("true_color"):
+            e.dxf.discard("true_color")
+        ctx.out.touched.changed.add(e.dxf.handle)
+    ctx.out.summaries.append(f"Set colour of {_noun(ents, ctx)} to {'by layer' if by_layer else c}")
+
+
+@op("create_layer", ["name", "color"], "create_layer(name, color?)  add a layer.")
+def _create_layer(ctx: Ctx, a: dict) -> None:
+    name = _layer_name(a.get("name"), "create_layer")
+    if ctx.doc.layers.has_entry(name):
+        raise OpError(f"create_layer: layer {name} already exists.")
+    layer = ctx.doc.layers.add(name)
+    if a.get("color") is not None:
+        layer.color = _color_index(a["color"])
+    ctx.out.touched.tables = True
+    ctx.out.summaries.append(f"Create layer {name}")
+
+
+@op("layer_props", ["layer", "color", "on", "frozen", "locked"], "layer_props(layer, color?, on?, frozen?, locked?)  change a layer's colour or visibility.")
+def _layer_props(ctx: Ctx, a: dict) -> None:
+    name = _layer_name(a.get("layer"), "layer_props")
+    if not ctx.doc.layers.has_entry(name):
+        raise OpError(f"layer_props: there is no layer named {name}.")
+    layer = ctx.doc.layers.get(name)
+    changes = []
+    if a.get("color") is not None:
+        layer.color = _color_index(a["color"])  # the property keeps the layer's on/off state
+        changes.append(f"colour {a['color']}")
+    for key in ("on", "frozen", "locked"):
+        if a.get(key) is None:
+            continue
+        v = a[key]
+        if not isinstance(v, bool):
+            raise OpError(f"layer_props: '{key}' must be true or false.")
+        if key == "on":
+            layer.on() if v else layer.off()
+        elif key == "frozen":
+            layer.freeze() if v else layer.thaw()
+        else:
+            layer.lock() if v else layer.unlock()
+        changes.append(f"{key}={'yes' if v else 'no'}")
+    if not changes:
+        raise OpError("layer_props: nothing to change. Give color, on, frozen or locked.")
+    ctx.out.touched.tables = True
+    ctx.out.summaries.append(f"Layer {name}: {', '.join(changes)}")
+
+
+@op("rename_layer", ["old", "new"], "rename_layer(old, new)  rename a layer; if `new` exists, the two are merged.")
+def _rename_layer(ctx: Ctx, a: dict) -> None:
+    old, new = _layer_name(a.get("old"), "rename_layer"), _layer_name(a.get("new"), "rename_layer")
+    if old.lower() in PROTECTED_LAYERS:
+        raise OpError(f"rename_layer: layer {old} can't be renamed.")
+    if not ctx.doc.layers.has_entry(old):
+        raise OpError(f"rename_layer: there is no layer named {old}.")
+    if old.lower() == new.lower():
+        raise OpError("rename_layer: old and new names are the same.")
+    merge = ctx.doc.layers.has_entry(new)
+    if not merge:
+        src = ctx.doc.layers.get(old)
+        dst = ctx.doc.layers.add(new)
+        dst.dxf.color, dst.dxf.linetype = src.dxf.color, src.dxf.linetype
+    n = 0
+    msp_handles = {e.dxf.handle for e in ctx.msp}
+    for e in list(ctx.doc.entitydb.values()):
+        if e.dxf.hasattr("layer") and e.dxf.layer.lower() == old.lower():
+            e.dxf.layer = new
+            if e.dxf.handle in msp_handles:
+                ctx.out.touched.changed.add(e.dxf.handle)
+                n += 1
+    try:
+        ctx.doc.layers.remove(old)
+    except DXFError as e:
+        raise OpError(f"rename_layer: layer {old} can't be removed ({e}).") from e
+    ctx.out.touched.tables = True
+    ctx.out.summaries.append(f"{'Merge' if merge else 'Rename'} layer {old} → {new} ({n:,} {'entity' if n == 1 else 'entities'})")
+
+
+@op("purge_unused_layers", [], "purge_unused_layers()  delete layers nothing is drawn on.")
+def _purge_layers(ctx: Ctx, a: dict) -> None:
+    used = {e.dxf.layer.lower() for e in ctx.doc.entitydb.values() if e.dxf.hasattr("layer")}
+    current = str(ctx.doc.header.get("$CLAYER", "0")).lower()
+    dead = [l.dxf.name for l in ctx.doc.layers if l.dxf.name.lower() not in used | PROTECTED_LAYERS | {current}]
+    if not dead:
+        raise OpError("purge_unused_layers: there are no unused layers.")
+    for name in dead:
+        ctx.doc.layers.remove(name)
+    ctx.out.touched.tables = True
+    shown = ", ".join(sorted(dead)[:8]) + (f" and {len(dead) - 8} more" if len(dead) > 8 else "")
+    ctx.out.summaries.append(f"Delete {len(dead)} unused layer{'s' if len(dead) != 1 else ''}: {shown}")
+
+
+def _target_layer(ctx: Ctx, a: dict, what: str) -> dict:
+    name = _layer_name(a["layer"], what) if a.get("layer") else "0"
+    _ensure_layer(ctx, name)
+    return {"layer": name}
+
+
+def _created(ctx: Ctx, entity, label: str) -> None:
+    ctx.out.touched.created.add(entity.dxf.handle)
+    ctx.out.summaries.append(label)
+
+
+@op("add_line", ["x1", "y1", "x2", "y2", "layer"], "add_line(x1, y1, x2, y2, layer?)")
+def _add_line(ctx: Ctx, a: dict) -> None:
+    p = [ctx.length(a.get(k), k) for k in ("x1", "y1", "x2", "y2")]
+    if p[0] == p[2] and p[1] == p[3]:
+        raise OpError("add_line: start and end are the same point.")
+    e = ctx.msp.add_line((p[0], p[1]), (p[2], p[3]), dxfattribs=_target_layer(ctx, a, "add_line"))
+    _created(ctx, e, f"Add a line of length {ctx.show(math.hypot(p[2] - p[0], p[3] - p[1]))}")
+
+
+@op("add_polyline", ["points", "closed", "layer"], "add_polyline(points=[[x,y],...], closed?, layer?)")
+def _add_polyline(ctx: Ctx, a: dict) -> None:
+    pts = a.get("points")
+    if not isinstance(pts, list) or len(pts) < 2 or len(pts) > 5000:
+        raise OpError("add_polyline: points must be a list of 2 to 5000 [x, y] pairs.")
+    try:
+        xy = [(ctx.length(p[0], "points"), ctx.length(p[1], "points")) for p in pts]
+    except (TypeError, IndexError, KeyError) as e:
+        raise OpError("add_polyline: each point must be [x, y].") from e
+    e = ctx.msp.add_lwpolyline(xy, close=bool(a.get("closed")), dxfattribs=_target_layer(ctx, a, "add_polyline"))
+    _created(ctx, e, f"Add a {'closed ' if a.get('closed') else ''}polyline with {len(xy)} points")
+
+
+@op("add_rect", ["x", "y", "width", "height", "layer"], "add_rect(x, y, width, height, layer?)  x, y is the lower-left corner.")
+def _add_rect(ctx: Ctx, a: dict) -> None:
+    x, y = ctx.length(a.get("x"), "x"), ctx.length(a.get("y"), "y")
+    w, h = ctx.length(a.get("width"), "width"), ctx.length(a.get("height"), "height")
+    if w == 0 or h == 0:
+        raise OpError("add_rect: width and height can't be zero.")
+    e = ctx.msp.add_lwpolyline([(x, y), (x + w, y), (x + w, y + h), (x, y + h)], close=True, dxfattribs=_target_layer(ctx, a, "add_rect"))
+    _created(ctx, e, f"Add a {ctx.show(abs(w))} × {ctx.show(abs(h))} rectangle")
+
+
+@op("add_circle", ["cx", "cy", "radius", "layer"], "add_circle(cx, cy, radius, layer?)")
+def _add_circle(ctx: Ctx, a: dict) -> None:
+    cx, cy, r = ctx.length(a.get("cx"), "cx"), ctx.length(a.get("cy"), "cy"), ctx.length(a.get("radius"), "radius")
+    if r <= 0:
+        raise OpError("add_circle: radius must be positive.")
+    e = ctx.msp.add_circle((cx, cy), r, dxfattribs=_target_layer(ctx, a, "add_circle"))
+    _created(ctx, e, f"Add a circle of radius {ctx.show(r)}")
+
+
+@op("add_text", ["x", "y", "text", "height", "rotation", "layer"], "add_text(x, y, text, height?, rotation?, layer?)")
+def _add_text(ctx: Ctx, a: dict) -> None:
+    text = a.get("text")
+    if not isinstance(text, str) or not text.strip() or len(text) > 500:
+        raise OpError("add_text: text must be a non-empty string (max 500 characters).")
+    x, y = ctx.length(a.get("x"), "x"), ctx.length(a.get("y"), "y")
+    h = ctx.length(a["height"], "height") if a.get("height") is not None else ctx.text_height
+    if h <= 0:
+        raise OpError("add_text: height must be positive.")
+    attribs = {**_target_layer(ctx, a, "add_text"), "height": h, "rotation": _number(a, "rotation", "add_text", default=0)}
+    e = ctx.msp.add_text(text, dxfattribs=attribs)
+    e.set_placement((x, y))
+    _created(ctx, e, f"Add text “{text[:40]}”")
+
+
+@op("replace_text", ["find", "replace", "selector", "case_sensitive"], "replace_text(find, replace, selector?, case_sensitive?)  replace text in TEXT/MTEXT/block attributes; the whole drawing unless a selector is given.")
+def _replace_text(ctx: Ctx, a: dict) -> None:
+    find, repl = a.get("find"), a.get("replace")
+    if not isinstance(find, str) or not find or not isinstance(repl, str):
+        raise OpError("replace_text: 'find' (non-empty) and 'replace' must be strings.")
+    flags = 0 if a.get("case_sensitive") else re.IGNORECASE
+    pattern = re.compile(re.escape(find), flags)
+    if a.get("selector"):
+        ents = resolve(ctx, a["selector"])
+    else:
+        ents = [e for e in ctx.msp if e.dxftype() in ("TEXT", "MTEXT", "INSERT")]
+    hits = changed = 0
+    for e in ents:
+        kind = e.dxftype()
+        targets = []
+        if kind == "MTEXT":
+            targets.append((e, "text"))
+        elif kind == "TEXT":
+            targets.append((e, "text"))
+        elif kind == "INSERT":
+            targets.extend((att, "text") for att in e.attribs)
+        touched = False
+        for obj, field_name in targets:
+            current = obj.text if kind == "MTEXT" and obj is e else obj.dxf.get(field_name, "")
+            new, n = pattern.subn(repl.replace("\\", "\\\\"), current)
+            if n:
+                if kind == "MTEXT" and obj is e:
+                    obj.text = new
+                else:
+                    obj.dxf.set(field_name, new)
+                hits += n
+                touched = True
+        if touched:
+            changed += 1
+            ctx.out.touched.changed.add(e.dxf.handle)
+    if not hits:
+        raise OpError(f"replace_text: no text contains {find!r}.")
+    ctx.out.summaries.append(f"Replace “{find}” with “{repl}” in {changed:,} text item{'s' if changed != 1 else ''} ({hits:,} occurrence{'s' if hits != 1 else ''})")
+
+
+def vocabulary() -> str:
+    """The operation list, in the form given to the model."""
+    return "\n".join(spec.doc for spec in OPS.values())
+
+
+SELECTOR_HELP = (
+    'A selector is an object; every key you give must match (AND): '
+    '{"layer": "A-WALL" or ["A-*", ...] (wildcards ok, case-insensitive), '
+    '"type": line|polyline|circle|arc|text|block|dimension|hatch|spline|ellipse, '
+    '"text": substring of text content, "color": name or 1-255, "block": block name (wildcards ok), '
+    '"bbox": [xmin, ymin, xmax, ymax], "handles": ["2F", ...], "selection": true (the entities the person has clicked), "all": true}.'
+)
+
+
+def apply_ops(doc: Drawing, ops: list, units: Units, selection: list[str], text_height: float, *, max_ops: int = 12) -> Applied:
+    """Carry out a list of operations on ``doc`` (mutating it). Raises OpError."""
+    if not isinstance(ops, list) or not ops:
+        raise OpError("ops must be a non-empty list.")
+    if len(ops) > max_ops:
+        raise OpError(f"At most {max_ops} operations per proposal; got {len(ops)}.")
+    out = Applied()
+    ctx = Ctx(doc, units, selection, text_height, out)
+    for i, raw in enumerate(ops, 1):
+        if not isinstance(raw, dict) or not isinstance(raw.get("op"), str):
+            raise OpError(f"Operation {i} must be an object with an 'op' name.")
+        spec = OPS.get(raw["op"])
+        if spec is None:
+            raise OpError(f"Operation {i}: unknown op {raw['op']!r}. Available: {', '.join(OPS)}.")
+        extra = set(raw) - spec.keys - {"op"}
+        if extra:
+            raise OpError(f"Operation {i} ({spec.name}): unknown fields {sorted(extra)}. Allowed: {sorted(spec.keys)}.")
+        try:
+            spec.fn(ctx, raw)
+        except OpError as e:
+            raise OpError(f"Operation {i} ({spec.name}): {e}" if not str(e).startswith(spec.name) else f"Operation {i}: {e}") from e
+    # An entity that was changed and then deleted (or created and deleted) is just deleted / nothing.
+    t = out.touched
+    both = t.created & t.deleted  # made and then removed in the same proposal: never existed
+    t.created -= both
+    t.deleted -= both
+    t.changed -= t.deleted | both
+    return out

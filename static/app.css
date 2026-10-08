@@ -42,6 +42,8 @@ body {
   color: var(--color-accent);
 }
 .wordmark span { color: var(--color-text); }
+.top-tags { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; justify-content: flex-end; }
+.top-tags a.tag { text-decoration: none; }
 
 /* type */
 .hero {

@@ -15,6 +15,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 
+from .editor.routes import install as install_editor
+from .editor.session import EditorStore
 from .engines import Engines
 from .jobs import RETENTION_SECONDS, Job, JobManager, file_info
 from .versions import BY_YEAR, DEFAULT_TARGET_YEAR, TARGET_YEARS, DetectError, detect, order
@@ -34,11 +36,15 @@ async def lifespan(app: FastAPI):
     engines = Engines.discover()
     logging.getLogger("backdate").info("engines: %s", engines.describe())
     app.state.jobs = JobManager(DATA_DIR, engines)
+    # The AI editor keeps its sessions beside the jobs, not inside the folder
+    # the job sweeper cleans.
+    app.state.editor = EditorStore(DATA_DIR.parent / (DATA_DIR.name + "-editor"))
     yield
     app.state.jobs.shutdown()
 
 
 app = FastAPI(title="Backdate.dwg", lifespan=lifespan)
+install_editor(app)  # /api/editor/* (the AI editor); registered before the static mount below
 # The static front end (e.g. on Vercel) may call this API from another origin.
 app.add_middleware(
     CORSMiddleware,
