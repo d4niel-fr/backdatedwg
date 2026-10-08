@@ -21,6 +21,9 @@ from .versions import Detected, FormatVersion
 log = logging.getLogger("backdate.jobs")
 
 RETENTION_SECONDS = int(os.environ.get("BACKDATE_RETENTION_SECONDS", "3600"))
+# Folders whose names start with "_" belong to other features (the AI editor
+# keeps its sessions in DATA_DIR/_editor) and are never swept as stale jobs.
+EDITOR_SUBDIR = "_editor"
 MAX_WORKERS = int(os.environ.get("BACKDATE_WORKERS", "2"))
 
 
@@ -234,7 +237,7 @@ class JobManager:
         # Folders left behind by a previous process (e.g. after a restart).
         known = set(self.jobs)
         for d in self.root.iterdir():
-            if d.is_dir() and d.name not in known:
+            if d.is_dir() and d.name not in known and not d.name.startswith("_"):
                 try:
                     if now - d.stat().st_mtime >= RETENTION_SECONDS:
                         shutil.rmtree(d, ignore_errors=True)

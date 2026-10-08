@@ -1,0 +1,197 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AI editor · Backdate.dwg</title>
+<meta name="description" content="Open a DWG or DXF next to a chat and edit it by asking. Every change is shown before it is applied.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Ccircle cx='16' cy='16' r='16' fill='%23c67139'/%3E%3Cpath d='M16 22V10m-5 5 5-5 5 5' stroke='%23fff' stroke-width='3' fill='none' stroke-linecap='round' stroke-linejoin='round' transform='rotate(180 16 16)'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="organic.css">
+<link rel="stylesheet" href="app.css">
+<link rel="stylesheet" href="editor.css">
+</head>
+<body class="ed">
+
+<header class="ed-top">
+  <a class="wordmark" href="./" aria-label="Backdate.dwg home">Backdate<span>.dwg</span></a>
+  <span class="tag tag-accent-2" id="mode-tag">AI editor · beta</span>
+  <span class="ed-file" id="file-name" hidden></span>
+  <div class="ed-people" id="people" aria-label="People here"></div>
+  <div class="ed-top-actions" id="top-actions" hidden>
+    <button type="button" class="btn btn-ghost" id="undo-btn" disabled title="Undo (Ctrl+Z)">Undo</button>
+    <button type="button" class="btn btn-ghost" id="redo-btn" disabled title="Redo (Ctrl+Y)">Redo</button>
+    <button type="button" class="btn btn-secondary" id="dl-btn">Download DXF</button>
+    <button type="button" class="btn btn-primary" id="export-btn" aria-haspopup="dialog">Save as older version…</button>
+    <button type="button" class="btn btn-ghost" id="close-btn" title="Close this drawing">Close</button>
+  </div>
+</header>
+
+<main class="ed-main" id="main">
+
+  <!-- left: the drawing -->
+  <section class="ed-view" id="view" aria-label="Drawing">
+    <div class="ed-canvas-wrap" id="canvas-wrap" hidden>
+      <canvas id="cv" tabindex="0" role="img" aria-label="Drawing viewer. Drag to pan, scroll to zoom, click to select, Shift-drag to box select, Alt-drag to mark an area."></canvas>
+      <div class="ed-tools" role="toolbar" aria-label="Viewer tools">
+        <button type="button" class="btn btn-secondary btn-icon" id="fit-btn" title="Fit to window (F)" aria-label="Fit to window">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.25" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5"/></svg>
+        </button>
+        <button type="button" class="btn btn-secondary btn-icon" id="box-btn" title="Box select mode (B)" aria-label="Box select mode" aria-pressed="false">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.25" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="4" y="4" width="16" height="16" rx="1.5" stroke-dasharray="3 3"/></svg>
+        </button>
+        <button type="button" class="btn btn-secondary btn-icon" id="area-btn" title="Mark an area to ask about (A, or Alt-drag)" aria-label="Mark an area" aria-pressed="false">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.25" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 7V3h4M17 3h4v4M21 17v4h-4M7 21H3v-4"/><circle cx="12" cy="12" r="2.5"/></svg>
+        </button>
+        <button type="button" class="btn btn-secondary" id="layers-btn" aria-haspopup="true" aria-expanded="false">Layers</button>
+        <form class="ed-find" id="find-form" role="search" autocomplete="off">
+          <input class="input" id="find-input" type="search" placeholder="Find text, block, layer…" aria-label="Find in drawing">
+        </form>
+      </div>
+      <ul class="ed-find-results panel" id="find-results" hidden aria-label="Find results"></ul>
+      <div class="ed-layers panel" id="layers-pop" hidden role="dialog" aria-label="Layers">
+        <div class="ed-layers-head">
+          <strong>Layers</strong>
+          <span class="muted small">Viewing only. This doesn't change the file.</span>
+        </div>
+        <div class="ed-layers-actions">
+          <button type="button" class="btn btn-ghost" id="layers-all">Show all</button>
+          <button type="button" class="btn btn-ghost" id="layers-none">Hide all</button>
+        </div>
+        <ul id="layers-list"></ul>
+      </div>
+      <div class="ed-status" aria-live="off">
+        <span id="st-coords">&nbsp;</span>
+        <span id="st-hover"></span>
+        <span id="st-sel"></span>
+      </div>
+      <div class="ed-banner" id="banner" hidden></div>
+      <div class="ed-legend" id="legend" hidden>
+        <span><i class="lg-del"></i><span id="legend-del">will be removed or moved</span></span>
+        <span><i class="lg-add"></i><span id="legend-add">new position / added</span></span>
+        <span id="legend-chg-wrap" hidden><i class="lg-chg"></i>changed</span>
+        <button type="button" class="btn btn-ghost" id="legend-close" hidden>Hide</button>
+      </div>
+    </div>
+
+    <!-- shown until a drawing is open -->
+    <div class="ed-empty" id="empty">
+      <h1 class="hero">Edit a drawing by asking.</h1>
+      <p class="lede">Open a DWG or DXF beside a chat. Say what to change, review exactly what would change, then accept it.</p>
+      <div class="drop" id="drop" data-state="empty">
+        <input type="file" id="file-input" accept=".dwg,.dxf,.pdf,.wdp,.json,.png,.jpg,.jpeg,.webp" hidden>
+        <div class="drop-empty">
+          <div class="disc disc-accent" aria-hidden="true">
+            <svg width="30" height="30" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.75" stroke-linecap="round" stroke-linejoin="round"><path d="M12 16V4"/><path d="m6 10 6-6 6 6"/><path d="M4 20h16"/></svg>
+          </div>
+          <div class="drop-title" id="drop-title">Drop a drawing here</div>
+          <div class="muted" id="drop-hint">.dwg or .dxf to edit. Also: a PDF plan, a photo of a sketch, or a Warehouse Designer Pro project (.wdp). Up to 200 MB.</div>
+        </div>
+        <div class="ed-import" id="import-opts" hidden>
+          <strong id="import-title"></strong>
+          <div class="ed-import-row" id="import-pdf" hidden>
+            <label>Page <input class="input" type="number" id="import-page" min="1" value="1"></label>
+            <label>Drawing scale 1: <input class="input" type="number" id="import-scale" min="0.001" step="any" value="1"></label>
+          </div>
+          <div class="ed-import-row" id="import-sketch" hidden>
+            <label>Real width of the sketched area <input class="input" type="number" id="import-width" min="0.5" step="any" value="30"> m</label>
+          </div>
+          <p class="muted small" id="import-note"></p>
+          <div class="row">
+            <button type="button" class="btn btn-primary" id="import-go">Import</button>
+            <button type="button" class="btn btn-ghost" id="import-cancel">Cancel</button>
+          </div>
+        </div>
+        <div class="drop-error" id="drop-error" role="alert" hidden>
+          <span class="tag tag-accent">Can't open this file</span>
+          <p id="drop-error-msg"></p>
+        </div>
+        <div class="drop-actions">
+          <button type="button" class="btn btn-primary" id="choose-btn">Choose file</button>
+          <button type="button" class="btn btn-secondary" id="sample-btn">Try a sample warehouse</button>
+        </div>
+      </div>
+      <p class="muted small ed-privacy" id="privacy">Your drawing stays on this server. Built-in commands run locally.</p>
+    </div>
+    <div class="ed-busy" id="busy" hidden role="status"><span class="spinner" aria-hidden="true"></span><span id="busy-text">Opening…</span></div>
+  </section>
+
+  <div class="ed-split" id="split" role="separator" aria-orientation="vertical" aria-label="Resize side panel" tabindex="0"></div>
+
+  <!-- right: the conversation and tools -->
+  <aside class="ed-chat" id="chat" aria-label="Assistant">
+    <div class="ed-tabs" role="tablist" id="tabs">
+      <button type="button" role="tab" class="ed-tab" id="tab-chat" aria-selected="true" aria-controls="pane-chat">Assistant</button>
+      <button type="button" role="tab" class="ed-tab" id="tab-tools" aria-selected="false" aria-controls="pane-tools">Tools</button>
+      <button type="button" role="tab" class="ed-tab" id="tab-log" aria-selected="false" aria-controls="pane-log">Changes <span class="tag tag-neutral" id="log-count">0</span></button>
+      <span class="tag tag-neutral ed-ai" id="ai-pill" title=""></span>
+    </div>
+
+    <div class="ed-pane" id="pane-chat" role="tabpanel" aria-labelledby="tab-chat">
+      <div class="ed-log" id="messages" role="log" aria-live="polite" aria-relevant="additions"></div>
+      <div class="ed-suggest" id="suggest"></div>
+      <form class="ed-compose" id="compose" autocomplete="off">
+        <div class="ed-selchip" id="selchip" hidden>
+          <span id="selchip-text"></span>
+          <button type="button" class="btn btn-ghost" id="selchip-clear" aria-label="Clear selection">Clear</button>
+        </div>
+        <div class="ed-selchip ed-areachip" id="areachip" hidden>
+          <span id="areachip-text"></span>
+          <button type="button" class="btn btn-ghost" id="areachip-clear" aria-label="Clear area">Clear</button>
+        </div>
+        <div class="ed-compose-row">
+          <textarea id="input" rows="2" class="input" placeholder="Describe a change…  e.g. “move layer S-RACK 2 m east”" aria-label="Message" disabled></textarea>
+          <button type="button" class="btn btn-secondary btn-icon" id="mic-btn" title="Speak (voice input)" aria-label="Speak" aria-pressed="false" hidden>
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.25" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5 11a7 7 0 0 0 14 0M12 18v3"/></svg>
+          </button>
+          <button type="submit" class="btn btn-primary" id="send-btn" disabled>Send</button>
+        </div>
+        <div class="muted small ed-hint">Enter to send · Shift+Enter for a new line, or one command per line as a script · click the drawing to select things · Alt-drag to mark an area</div>
+      </form>
+    </div>
+
+    <div class="ed-pane" id="pane-tools" role="tabpanel" aria-labelledby="tab-tools" hidden>
+      <div class="ed-toolsbody" id="tools"></div>
+    </div>
+
+    <div class="ed-pane" id="pane-log" role="tabpanel" aria-labelledby="tab-log" hidden>
+      <ol class="ed-changes" id="changes"></ol>
+    </div>
+
+    <div class="ed-pane" id="pane-review" hidden>
+      <div class="ed-toolsbody" id="review"></div>
+    </div>
+  </aside>
+</main>
+
+<dialog class="ed-dialog panel" id="export-dlg" aria-labelledby="export-title">
+  <form method="dialog" id="export-form">
+    <h2 id="export-title" class="dlg-title">Save as an older version</h2>
+    <p class="muted small" id="export-lede"></p>
+    <fieldset>
+      <legend>Convert to</legend>
+      <div class="chips" id="export-targets" role="radiogroup" aria-label="Target AutoCAD version"></div>
+    </fieldset>
+    <fieldset>
+      <legend>Format</legend>
+      <div class="chips chips-sage" id="export-formats" role="radiogroup" aria-label="Output format"></div>
+      <p class="hint small muted" id="export-hint"></p>
+    </fieldset>
+    <div class="bar" id="export-bar" hidden role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><div class="bar-fill" id="export-fill"></div></div>
+    <p class="small" id="export-status" role="status"></p>
+    <div class="row">
+      <button type="button" class="btn btn-primary" id="export-go">Convert</button>
+      <button type="button" class="btn btn-secondary" id="export-dl" hidden>Download</button>
+      <button type="button" class="btn btn-ghost" id="export-report" hidden>Report (.txt)</button>
+      <button type="button" class="btn btn-ghost" id="export-close">Close</button>
+    </div>
+  </form>
+</dialog>
+
+<div class="ed-toast" id="toast" role="status" aria-live="polite" hidden></div>
+
+<script src="config.js"></script>
+<script src="editor.js"></script>
+<script src="editor-tools.js"></script>
+<script src="editor-review.js"></script>
+</body>
+</html>

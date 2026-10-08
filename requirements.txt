@@ -2,3 +2,4 @@ fastapi>=0.115,<1
 uvicorn[standard]>=0.30
 python-multipart>=0.0.9
 ezdxf>=1.4,<2
+pypdf>=4,<7

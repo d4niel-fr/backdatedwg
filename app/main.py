@@ -15,8 +15,12 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 
+from .editor import llm as editor_llm
+from .editor.batch import BatchManager, start_watcher_from_env
+from .editor.routes import install as install_editor
+from .editor.session import EditorStore
 from .engines import Engines
-from .jobs import RETENTION_SECONDS, Job, JobManager, file_info
+from .jobs import EDITOR_SUBDIR, RETENTION_SECONDS, Job, JobManager, file_info
 from .versions import BY_YEAR, DEFAULT_TARGET_YEAR, TARGET_YEARS, DetectError, detect, order
 
 logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"))
@@ -34,11 +38,21 @@ async def lifespan(app: FastAPI):
     engines = Engines.discover()
     logging.getLogger("backdate").info("engines: %s", engines.describe())
     app.state.jobs = JobManager(DATA_DIR, engines)
+    # The AI editor keeps its sessions in DATA_DIR/_editor: inside the data
+    # folder (the only place the Docker user can write), in a "_" folder the
+    # job sweeper leaves alone.
+    app.state.editor = EditorStore(Path(os.environ.get("BACKDATE_EDITOR_DIR") or DATA_DIR / EDITOR_SUBDIR))
+    app.state.batches = BatchManager(app.state.editor.root / "_batch", engines, editor_llm.from_env)
+    watcher = start_watcher_from_env(engines)  # optional hot folder (BACKDATE_WATCH_DIR + BACKDATE_WATCH_RECIPE)
     yield
+    if watcher:
+        watcher.stop_event.set()
+    app.state.batches.shutdown()
     app.state.jobs.shutdown()
 
 
 app = FastAPI(title="Backdate.dwg", lifespan=lifespan)
+install_editor(app)  # /api/editor/* (the AI editor); registered before the static mount below
 # The static front end (e.g. on Vercel) may call this API from another origin.
 app.add_middleware(
     CORSMiddleware,
