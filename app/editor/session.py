@@ -99,6 +99,7 @@ class EditorSession:
         self.memory = memory  # MemoryStore or None
         self.previous: Optional[dict] = None  # what was remembered when this drawing was opened
         self.original_path: Optional[Path] = None  # the file as uploaded, for the proof pack
+        self.original_name: Optional[str] = None
         self._original = zlib.compress(dump(doc).encode("utf-8"), 1)  # the drawing as opened, for "what changed since"
         self.name = name
         self.doc = doc

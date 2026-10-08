@@ -12,7 +12,7 @@ import uuid
 from pathlib import Path
 from typing import Optional
 
-from fastapi import APIRouter, FastAPI, File, Query, Request, UploadFile
+from fastapi import APIRouter, FastAPI, File, Form, Query, Request, UploadFile
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field
 
@@ -20,7 +20,7 @@ from .. import converter
 from ..engines import CancelToken
 from ..jobs import Job
 from ..versions import BY_YEAR, TARGET_YEARS, DetectError, detect, order
-from . import agent, analysis, compare, exports, llm, ops, sample, standards
+from . import agent, analysis, compare, exports, importers, llm, ops, sample, standards
 from .memory import file_fingerprint
 from .session import AI_LIMIT, EditorError, EditorSession, EditorStore
 
@@ -28,6 +28,7 @@ router = APIRouter(prefix="/api/editor")
 
 MAX_UPLOAD = int(os.environ.get("BACKDATE_MAX_UPLOAD_MB", "200")) * 1024 * 1024
 ALLOWED_EXT = {".dwg", ".dxf"}
+IMPORT_EXT = {".pdf", ".wdp", ".json", ".png", ".jpg", ".jpeg", ".webp"}
 
 
 def error(status: int, code: str, message: str) -> JSONResponse:
@@ -74,12 +75,16 @@ def config(request: Request):
 
 
 @router.post("/sessions", status_code=201)
-async def open_drawing(request: Request, file: UploadFile = File(...)):
+async def open_drawing(request: Request, file: UploadFile = File(...), page: int = Form(1), scale: float = Form(1.0), width_m: float = Form(0.0)):
+    """Open a DWG/DXF, or import a PDF plan, a sketch image or a rack-designer project as a new drawing."""
     st = store(request)
     jobs = request.app.state.jobs
     name = Path(file.filename or "drawing").name
-    if Path(name).suffix.lower() not in ALLOWED_EXT:
-        return error(415, "unsupported_type", "Only .dwg and .dxf files can be opened.")
+    ext = Path(name).suffix.lower()
+    if ext in IMPORT_EXT:
+        return await _import(request, file, name, ext, page, scale, width_m)
+    if ext not in ALLOWED_EXT:
+        return error(415, "unsupported_type", "Open a .dwg or .dxf drawing, or import a .pdf plan, a sketch image (.png/.jpg) or a .wdp project.")
     work = st.root / f"_open-{uuid.uuid4().hex}"
     work.mkdir(parents=True)
     src = work / ("source" + Path(name).suffix.lower())
@@ -117,11 +122,62 @@ def _open(request: Request, src: Path, name: str, det, work: Path):
     session = store(request).create(doc, name, notes, label, fingerprint=file_fingerprint(src))
     keep = session.dir / ("original" + src.suffix.lower())
     shutil.copyfile(src, keep)
-    session.original_path = keep
+    session.original_path, session.original_name = keep, name
     return JSONResponse(session.summary(), status_code=201)
 
 
 SAMPLE_FINGERPRINT = "sample-warehouse-v1"
+
+
+async def _read_upload(file: UploadFile, limit: int = MAX_UPLOAD) -> bytes:
+    chunks, size = [], 0
+    while chunk := await file.read(1024 * 1024):
+        size += len(chunk)
+        if size > limit:
+            raise EditorError(413, "too_large", f"That file is over {limit // (1024 * 1024)} MB.")
+        chunks.append(chunk)
+    await file.close()
+    data = b"".join(chunks)
+    if not data:
+        raise EditorError(400, "empty", "That file is empty.")
+    return data
+
+
+async def _import(request: Request, file: UploadFile, name: str, ext: str, page: int, scale: float, width_m: float):
+    data = await _read_upload(file)
+    try:
+        if ext == ".pdf":
+            doc, notes = importers.pdf_to_dxf(data, page, scale)
+            label, new_name = f"PDF page {page}", Path(name).stem + ".dxf"
+        elif ext in (".wdp", ".json"):
+            doc, project, notes = importers.wdp_to_dxf(data)
+            label, new_name = "Warehouse Designer Pro project", project + ".dxf"
+        else:
+            if width_m <= 0:
+                raise importers.ImportError_("Say how wide the sketched area is in real life (metres), so the trace comes out at the right size.")
+            doc, notes = importers.sketch_to_dxf(data, width_m, llm.vision_from_env() if getattr(request.app.state, "editor_vision", None) is None else request.app.state.editor_vision)
+            label, new_name = "Traced sketch", Path(name).stem + "_traced.dxf"
+    except importers.ImportError_ as e:
+        return error(422, "import_failed", str(e))
+    except llm.LLMError as e:
+        return error(502, "ai_failed", str(e))
+    from .memory import fingerprint as fp_of
+
+    session = store(request).create(doc, new_name, notes, label, fingerprint=fp_of(data))
+    keep = session.dir / ("original" + ext)
+    keep.write_bytes(data)
+    session.original_path, session.original_name = keep, name
+    return JSONResponse(session.summary(), status_code=201)
+
+
+@router.post("/parse-table")
+async def parse_table(file: UploadFile = File(...)):
+    """CSV or Excel → columns and rows (for drawing a table or filling a title block)."""
+    data = await _read_upload(file, 20 * 1024 * 1024)
+    try:
+        return importers.parse_table(data, Path(file.filename or "").name)
+    except importers.ImportError_ as e:
+        return error(422, "bad_table", str(e))
 
 
 @router.post("/sessions/sample", status_code=201)
@@ -615,7 +671,7 @@ def proof_pack(sid: str, request: Request):
         pdf, info = exports.drawing_pdf(s.scene(), units_to_m=u.to_m, units_name=u.name, units_guessed=u.guessed, name=s.name)
     files: dict[str, bytes] = {}
     if s.original_path and s.original_path.exists():
-        files[f"original/{s.name}"] = s.original_path.read_bytes()
+        files[f"original/{s.original_name or s.name}"] = s.original_path.read_bytes()
     else:
         buf = io.StringIO()
         original.write(buf)
