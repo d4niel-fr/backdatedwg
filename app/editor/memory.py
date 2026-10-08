@@ -34,6 +34,26 @@ def enabled() -> bool:
     return os.environ.get("BACKDATE_EDITOR_MEMORY", "on").lower() not in ("off", "0", "false", "no")
 
 
+WORKSPACE_RE = r"[A-Za-z0-9_\-]{16,128}"
+
+
+def valid_workspace(ws: Optional[str]) -> Optional[str]:
+    """A workspace key from the page (a random id kept by the browser, or shared by a team)."""
+    return ws if ws and re.fullmatch(WORKSPACE_RE, ws) else None
+
+
+def scoped(workspace: Optional[str], fp: Optional[str]) -> Optional[str]:
+    """The memory key for one drawing in one workspace. No workspace, no memory:
+    two people who open the same file never see each other's history."""
+    if not workspace or not fp:
+        return None
+    return hashlib.sha256(f"{workspace}:{fp}".encode()).hexdigest()[:32]
+
+
+def ws_tag(workspace: Optional[str]) -> Optional[str]:
+    return hashlib.sha256(f"ws:{workspace}".encode()).hexdigest()[:16] if workspace else None
+
+
 def fingerprint(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()[:32]
 
@@ -90,7 +110,7 @@ class MemoryStore:
         with self.lock:
             return self._load(fp)
 
-    def visit(self, fp: Optional[str], name: str, index: dict) -> Optional[dict]:
+    def visit(self, fp: Optional[str], name: str, index: dict, ws: Optional[str] = None) -> Optional[dict]:
         """Record an opening; returns what was remembered from before (or None)."""
         if not fp or not enabled():
             return None
@@ -100,7 +120,7 @@ class MemoryStore:
             now = time.time()
             data = before or {"fp": key, "first": now, "visits": 0, "changes": [], "chat": []}
             previous = {"visits": data["visits"], "last": data.get("last"), "changes": data["changes"][-10:], "chat": data["chat"][-6:]} if before else None
-            data.update({"name": name, "last": now, "visits": data["visits"] + 1, "index": index})
+            data.update({"name": name, "last": now, "visits": data["visits"] + 1, "index": index, "ws": ws})
             self._save(key, data)
             return previous
 
@@ -154,8 +174,9 @@ class MemoryStore:
             return removed
 
     # ── across drawings ────────────────────────────────────────────────────
-    def all(self) -> list[dict]:
-        if not enabled():
+    def all(self, ws: Optional[str] = None) -> list[dict]:
+        """Records of one workspace (never all of them: that would be everyone's drawings)."""
+        if not enabled() or not ws:
             return []
         out = []
         with self.lock:
@@ -164,18 +185,18 @@ class MemoryStore:
                     data = json.loads(p.read_text("utf-8"))
                 except (OSError, ValueError):
                     continue
-                if "alias" in data or time.time() - data.get("last", 0) > MEMORY_DAYS * 86400:
+                if "alias" in data or time.time() - data.get("last", 0) > MEMORY_DAYS * 86400 or data.get("ws") != ws:
                     continue
                 out.append(data)
         return out
 
-    def search(self, query: str, limit: int = 50) -> list[dict]:
+    def search(self, query: str, ws: Optional[str], limit: int = 50) -> list[dict]:
         """Drawings whose name, layers, blocks or labels contain every word of the query."""
         words = [w for w in re.split(r"\s+", query.lower().strip()) if w]
         if not words:
             return []
         hits = []
-        for rec in self.all():
+        for rec in self.all(ws):
             idx = rec.get("index") or {}
             fields = {
                 "name": [rec.get("name", "")],
@@ -193,14 +214,14 @@ class MemoryStore:
         hits.sort(key=lambda h: (-h["score"], -(h["last"] or 0)))
         return hits[:limit]
 
-    def similar(self, fp: str, limit: int = 10) -> list[dict]:
-        """Other drawings ranked by how much their layers, blocks and labels overlap."""
+    def similar(self, fp: str, ws: Optional[str], limit: int = 10) -> list[dict]:
+        """Other drawings in the same workspace, ranked by how much their layers, blocks and labels overlap."""
         me = self.get(fp)
         if not me:
             return []
         mine = _features(me.get("index") or {})
         out = []
-        for rec in self.all():
+        for rec in self.all(ws):
             if rec["fp"] == me["fp"]:
                 continue
             theirs = _features(rec.get("index") or {})

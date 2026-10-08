@@ -12,7 +12,7 @@ import uuid
 from pathlib import Path
 from typing import Optional
 
-from fastapi import APIRouter, FastAPI, File, Form, Query, Request, UploadFile
+from fastapi import APIRouter, Depends, FastAPI, File, Form, Query, Request, UploadFile
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field
 
@@ -21,10 +21,23 @@ from ..engines import CancelToken
 from ..jobs import Job
 from ..versions import BY_YEAR, TARGET_YEARS, DetectError, detect, order
 from . import agent, analysis, batch, compare, exports, importers, llm, ops, sample, share, standards
-from .memory import file_fingerprint
+from .memory import file_fingerprint, valid_workspace, ws_tag
+from .quotas import MeteredModel, Quotas
 from .session import AI_LIMIT, EditorError, EditorSession, EditorStore
 
-router = APIRouter(prefix="/api/editor")
+OPEN_PATHS = ("/api/editor/config", "/api/editor/usage", "/api/editor/shares/")
+
+
+def gate(request: Request) -> None:
+    """With BACKDATE_REQUIRE_TOKEN=1, only key holders may use the editor (review links stay open)."""
+    q = getattr(request.app.state, "quotas", None)
+    if q is None or not q.require or request.url.path.startswith(OPEN_PATHS):
+        return
+    if not q.allowed(request.headers):
+        raise EditorError(401, "access_key", "This editor needs an access key. Enter yours in the editor's settings.")
+
+
+router = APIRouter(prefix="/api/editor", dependencies=[Depends(gate)])
 
 MAX_UPLOAD = int(os.environ.get("BACKDATE_MAX_UPLOAD_MB", "200")) * 1024 * 1024
 ALLOWED_EXT = {".dwg", ".dxf"}
@@ -36,6 +49,7 @@ def error(status: int, code: str, message: str) -> JSONResponse:
 
 
 def install(app: FastAPI) -> None:
+    app.state.quotas = Quotas()
     app.include_router(router)
 
     @app.exception_handler(EditorError)
@@ -67,13 +81,33 @@ def session_of(request: Request, sid: str) -> EditorSession:
     return s
 
 
-def _model(request: Request):
+def workspace(request: Request) -> Optional[str]:
+    return valid_workspace(request.headers.get("x-workspace"))
+
+
+def _raw_model(request: Request):
     return getattr(request.app.state, "editor_llm", None) or llm.from_env()
+
+
+def _caller(request: Request) -> dict:
+    return request.app.state.quotas.caller(request.headers, request.client.host if request.client else None)
+
+
+def _model(request: Request):
+    """The chat model, counted against the caller's daily allowance."""
+    m = _raw_model(request)
+    return MeteredModel(m, request.app.state.quotas, _caller(request)) if m is not None else None
+
+
+@router.get("/usage")
+def usage(request: Request):
+    q = request.app.state.quotas
+    return {**q.usage(_caller(request)), "keysEnabled": bool(q.tokens), "keyRequired": q.require}
 
 
 @router.get("/config")
 def config(request: Request):
-    model = _model(request)
+    model = _raw_model(request)
     jobs = request.app.state.jobs
     return {
         "ai": {**llm.describe(model), "limit": AI_LIMIT, "vision": llm.vision_from_env() is not None},
@@ -132,7 +166,7 @@ def _open(request: Request, src: Path, name: str, det, work: Path):
     except converter.ConversionError as e:
         return error(422, e.code, e.message)
     label = f"{det.kind}, {det.version.label}" if det.version else det.kind
-    session = store(request).create(doc, name, notes, label, fingerprint=file_fingerprint(src))
+    session = store(request).create(doc, name, notes, label, fingerprint=file_fingerprint(src), workspace=workspace(request))
     keep = session.dir / ("original" + src.suffix.lower())
     shutil.copyfile(src, keep)
     session.original_path, session.original_name = keep, name
@@ -168,7 +202,10 @@ async def _import(request: Request, file: UploadFile, name: str, ext: str, page:
         else:
             if width_m <= 0:
                 raise importers.ImportError_("Say how wide the sketched area is in real life (metres), so the trace comes out at the right size.")
-            doc, notes = importers.sketch_to_dxf(data, width_m, llm.vision_from_env() if getattr(request.app.state, "editor_vision", None) is None else request.app.state.editor_vision)
+            vision = getattr(request.app.state, "editor_vision", None) or llm.vision_from_env()
+            if vision is not None:
+                vision = MeteredModel(vision, request.app.state.quotas, _caller(request))
+            doc, notes = importers.sketch_to_dxf(data, width_m, vision)
             label, new_name = "Traced sketch", Path(name).stem + "_traced.dxf"
     except importers.ImportError_ as e:
         return error(422, "import_failed", str(e))
@@ -176,7 +213,7 @@ async def _import(request: Request, file: UploadFile, name: str, ext: str, page:
         return error(502, "ai_failed", str(e))
     from .memory import fingerprint as fp_of
 
-    session = store(request).create(doc, new_name, notes, label, fingerprint=fp_of(data))
+    session = store(request).create(doc, new_name, notes, label, fingerprint=fp_of(data), workspace=workspace(request))
     keep = session.dir / ("original" + ext)
     keep.write_bytes(data)
     session.original_path, session.original_name = keep, name
@@ -195,7 +232,7 @@ async def parse_table(file: UploadFile = File(...)):
 
 @router.post("/sessions/sample", status_code=201)
 def open_sample(request: Request):
-    session = store(request).create(sample.build(), "Warehouse B (sample).dxf", [], "DXF, sample drawing", fingerprint=SAMPLE_FINGERPRINT)
+    session = store(request).create(sample.build(), "Warehouse B (sample).dxf", [], "DXF, sample drawing", fingerprint=SAMPLE_FINGERPRINT, workspace=workspace(request))
     return JSONResponse(session.summary(), status_code=201)
 
 
@@ -508,7 +545,7 @@ def standards_custom(sid: str, body: MappingBody, request: Request):
 @router.get("/sessions/{sid}/memory")
 def get_memory(sid: str, request: Request):
     s = session_of(request, sid)
-    rec = store(request).memory.get(s.fingerprint)
+    rec = store(request).memory.get(s.memory_key)
     if not rec:
         return {"remembered": False}
     return {"remembered": True, "visits": rec.get("visits", 0), "first": rec.get("first"), "last": rec.get("last"),
@@ -518,8 +555,8 @@ def get_memory(sid: str, request: Request):
 @router.delete("/sessions/{sid}/memory", status_code=204)
 def forget_memory(sid: str, request: Request):
     s = session_of(request, sid)
-    if s.fingerprint:
-        store(request).memory.forget(s.fingerprint)
+    if s.memory_key:
+        store(request).memory.forget(s.memory_key)
     s.previous = None
     return None
 
@@ -797,7 +834,9 @@ async def create_batch(request: Request, files: list[UploadFile] = File(...), re
             dest = d / "in" / f"{Path(name).stem}_{i}{Path(name).suffix}"
         dest.write_bytes(await _read_upload(f))
         saved.append(dest)
-    job = mgr.submit(batch.BatchJob(jid, d, saved, rec, dry_run=dry_run, callback=callback_url))
+    job = batch.BatchJob(jid, d, saved, rec, dry_run=dry_run, callback=callback_url)
+    job.model = _model(request) if rec.get("ai_instruction") else None  # counted against whoever started the batch
+    job = mgr.submit(job)
     return job.view()
 
 
@@ -1020,3 +1059,62 @@ def presence(sid: str, body: PresenceBody, request: Request):
 @router.get("/sessions/{sid}/people")
 def people(sid: str, request: Request):
     return {"people": session_of(request, sid).bus.people()}
+
+
+# ── search and similar drawings ─────────────────────────────────────────────
+
+
+@router.get("/search")
+def search(request: Request, q: str = Query(..., min_length=1, max_length=200)):
+    """Search every drawing opened in this workspace (by name, layer, block or label)."""
+    ws = workspace(request)
+    if not ws:
+        return error(400, "no_workspace", "Search needs a workspace key; the editor page sends one automatically.")
+    return {"results": store(request).memory.search(q, ws_tag(ws))}
+
+
+@router.get("/sessions/{sid}/similar")
+def similar(sid: str, request: Request):
+    s = session_of(request, sid)
+    if not s.memory_key:
+        return {"results": [], "note": "Similar drawings need a workspace key."}
+    return {"results": store(request).memory.similar(s.memory_key, s.ws_tag)}
+
+
+@router.get("/sessions/{sid}/find")
+def find(sid: str, request: Request, q: str = Query(..., min_length=1, max_length=200)):
+    """Find text, blocks, layers or a handle in the open drawing."""
+    s = session_of(request, sid)
+    needle = q.lower().strip()
+    hits: dict[str, dict] = {}
+    with s.lock:
+        boxes: dict[str, list[float]] = {}
+        for it in s.scene().items:
+            if it["k"] == "p":
+                p = it["p"]
+                b = [min(p[0::2]), min(p[1::2]), max(p[0::2]), max(p[1::2])]
+            else:
+                b = [it["x"], it["y"], it["x"] + it["s"] * max(1, len(it["v"])) * 0.6, it["y"] + it["s"]]
+            cur = boxes.setdefault(it["h"], b)
+            if cur is not b:
+                cur[0], cur[1], cur[2], cur[3] = min(cur[0], b[0]), min(cur[1], b[1]), max(cur[2], b[2]), max(cur[3], b[3])
+            if it["k"] == "t" and needle in it["v"].lower() and it["h"] not in hits:
+                hits[it["h"]] = {"handle": it["h"], "kind": "text", "label": " ".join(it["v"].split())[:80], "layer": it["l"]}
+            if len(hits) >= 500:
+                break
+        for e in s.doc.modelspace():
+            h = e.dxf.handle
+            if h in hits:
+                continue
+            if h.lower() == needle:
+                hits[h] = {"handle": h, "kind": "handle", "label": e.dxftype(), "layer": e.dxf.get("layer", "0")}
+            elif e.dxftype() == "INSERT" and needle in e.dxf.get("name", "").lower():
+                hits[h] = {"handle": h, "kind": "block", "label": e.dxf.get("name"), "layer": e.dxf.get("layer", "0")}
+            elif needle in e.dxf.get("layer", "0").lower() and len(hits) < 500:
+                hits[h] = {"handle": h, "kind": "layer", "label": e.dxftype(), "layer": e.dxf.get("layer", "0")}
+            if len(hits) >= 500:
+                break
+    rows = [{**r, "bbox": boxes.get(r["handle"])} for r in hits.values()]
+    order = {"handle": 0, "text": 1, "block": 2, "layer": 3}
+    rows.sort(key=lambda r: order[r["kind"]])
+    return {"results": rows[:500], "count": len(rows)}

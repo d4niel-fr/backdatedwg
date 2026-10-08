@@ -48,7 +48,12 @@ PROVIDERS = {
         "vision": "nvidia/nemotron-nano-12b-v2-vl",
     },
     "custom": {"label": "Custom", "base": "http://localhost:8001/v1", "model": "local-model", "vision": ""},
+    # Self-hosted, OpenAI-compatible servers: drawings never leave your network. No key needed.
+    "ollama": {"label": "Ollama (local)", "base": "http://localhost:11434/v1", "model": "llama3.1", "vision": "llava"},
+    "lmstudio": {"label": "LM Studio (local)", "base": "http://localhost:1234/v1", "model": "local-model", "vision": ""},
+    "vllm": {"label": "vLLM (self-hosted)", "base": "http://localhost:8001/v1", "model": "nvidia/nemotron-3-ultra-550b-a55b", "vision": ""},
 }
+LOCAL_PROVIDERS = ("ollama", "lmstudio", "vllm")
 KEY_NAMES = ("OPENROUTER_API_KEY", "AI_API_KEY", "NVIDIA_API_KEY", "NEMOTRON_API_KEY")
 
 # Kept for imports elsewhere and older configuration notes.
@@ -283,6 +288,8 @@ def _provider_for(key_name: str, key: str) -> str:
 
 def _settings(vision: bool = False) -> Optional[OpenAICompatModel]:
     key_name, key = next(((n, os.environ[n].strip()) for n in KEY_NAMES if os.environ.get(n, "").strip()), ("", ""))
+    if not key and os.environ.get("AI_PROVIDER", "").strip().lower() in LOCAL_PROVIDERS:
+        key = "local"  # local servers usually ignore the key
     if not key:
         return None
     provider = _provider_for(key_name, key)
@@ -303,7 +310,7 @@ def _settings(vision: bool = False) -> Optional[OpenAICompatModel]:
                 extra = parsed
         except ValueError:
             pass
-    reasoning = (_env("AI_REASONING") or "low").lower()
+    reasoning = (_env("AI_REASONING") or ("off" if provider in LOCAL_PROVIDERS else "low")).lower()
     try:
         max_tokens = max(256, min(int(_env("AI_MAX_TOKENS") or 4096), 32768))
     except ValueError:

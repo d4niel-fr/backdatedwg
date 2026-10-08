@@ -93,10 +93,15 @@ class EditorError(Exception):
 
 class EditorSession:
     def __init__(self, sid: str, name: str, doc: Drawing, root: Path, notes: Optional[list[str]] = None, source_label: str = "",
-                 fingerprint: Optional[str] = None, memory=None):
+                 fingerprint: Optional[str] = None, memory=None, workspace: Optional[str] = None):
+        from .memory import scoped, ws_tag
+
         self.id = sid
         self.fingerprint = fingerprint
-        self.memory = memory  # MemoryStore or None
+        self.workspace = workspace
+        self.memory_key = scoped(workspace, fingerprint)  # None: nothing is remembered
+        self.ws_tag = ws_tag(workspace)
+        self.memory = memory if self.memory_key else None  # MemoryStore or None
         self.previous: Optional[dict] = None  # what was remembered when this drawing was opened
         self.original_path: Optional[Path] = None  # the file as uploaded, for the proof pack
         self.original_name: Optional[str] = None
@@ -290,7 +295,7 @@ class EditorSession:
             applied_ops = [o for st in p.steps for o in st["ops"]] if p.steps else p.ops
             self.log.append({"rev": self.rev, "time": int(time.time()), "summaries": p.summaries, "prompt": p.prompt, "source": p.source, "ops": applied_ops})
             if self.memory is not None:
-                self.memory.add_change(self.fingerprint, p.summaries, p.prompt)
+                self.memory.add_change(self.memory_key, p.summaries, p.prompt)
             return p
 
     def reject(self, pid: str) -> Proposal:
@@ -345,10 +350,10 @@ class EditorSession:
                 for old in self.dir.glob("rev*.dxf"):
                     old.unlink(missing_ok=True)
                 self.doc.saveas(path)
-                if self.memory is not None and self.fingerprint:
-                    from .memory import file_fingerprint
+                if self.memory is not None and self.memory_key:
+                    from .memory import file_fingerprint, scoped
 
-                    self.memory.alias(file_fingerprint(path), self.fingerprint)  # reopening the edited copy remembers too
+                    self.memory.alias(scoped(self.workspace, file_fingerprint(path)), self.memory_key)  # reopening the edited copy remembers too
             return path
 
     def original_doc(self) -> Drawing:
@@ -374,7 +379,7 @@ class EditorSession:
         self.chat.append({"role": role, "content": content[:4000]})
         del self.chat[:-40]
         if role == "assistant" and self.memory is not None and len(self.chat) >= 2 and self.chat[-2]["role"] == "user":
-            self.memory.add_chat(self.fingerprint, self.chat[-2]["content"], content)
+            self.memory.add_chat(self.memory_key, self.chat[-2]["content"], content)
 
 
 MAX_STEPS = 8
@@ -416,18 +421,18 @@ class EditorStore:
                 pass
 
     def create(self, doc: Drawing, name: str, notes: Optional[list[str]] = None, source_label: str = "",
-               fingerprint: Optional[str] = None) -> EditorSession:
+               fingerprint: Optional[str] = None, workspace: Optional[str] = None) -> EditorSession:
         self.sweep()
         with self._lock:
             while len(self.sessions) >= MAX_SESSIONS:
                 oldest = min(self.sessions.values(), key=lambda s: s.touched)
                 self._drop(oldest.id)
             sid = uuid.uuid4().hex
-            session = EditorSession(sid, name, doc, self.root, notes, source_label, fingerprint, self.memory)
+            session = EditorSession(sid, name, doc, self.root, notes, source_label, fingerprint, self.memory, workspace)
             self.sessions[sid] = session
-        if fingerprint:
+        if session.memory_key:
             try:
-                session.previous = self.memory.visit(fingerprint, name, session.index())
+                session.previous = self.memory.visit(session.memory_key, name, session.index(), session.ws_tag)
             except (OSError, ValueError):
                 log.warning("couldn't record drawing memory", exc_info=True)
         return session

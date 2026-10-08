@@ -224,14 +224,18 @@ def test_suggestions_follow_the_drawing(s):
 # ── memory ──────────────────────────────────────────────────────────────────
 
 
+WS = "team-key-0123456789abcdef"
+WS2 = "someone-else-key-9876543210"
+
+
 def test_memory_across_sessions(store):
-    first = store.create(messy(), "messy.dxf", fingerprint="memfp001")
+    first = store.create(messy(), "messy.dxf", fingerprint="memfp001", workspace=WS)
     assert first.previous is None
     p = first.stage([{"op": "purge_unused_layers"}], [], "local", "purge unused layers")
     first.accept(p.id)
     first.remember("user", "is the office big enough?")
     first.remember("assistant", "It is 80 m².")
-    again = store.create(messy(), "messy.dxf", fingerprint="memfp001")
+    again = store.create(messy(), "messy.dxf", fingerprint="memfp001", workspace=WS)
     prev = again.previous
     assert prev["visits"] == 1 and prev["changes"][-1]["prompt"] == "purge unused layers"
     assert prev["chat"][-1]["user"] == "is the office big enough?"
@@ -243,19 +247,32 @@ def test_memory_across_sessions(store):
 def test_edited_copy_shares_memory(store):
     from app.editor.memory import file_fingerprint
 
-    s1 = store.create(messy(), "messy.dxf", fingerprint="origfp01")
+    s1 = store.create(messy(), "messy.dxf", fingerprint="origfp01", workspace=WS)
     p = s1.stage([{"op": "purge_unused_layers"}], [], "local", "purge")
     s1.accept(p.id)
     path = s1.write_current()
-    reopened = store.create(ezdxf.readfile(path), "messy_edited.dxf", fingerprint=file_fingerprint(path))
+    reopened = store.create(ezdxf.readfile(path), "messy_edited.dxf", fingerprint=file_fingerprint(path), workspace=WS)
     assert reopened.previous and reopened.previous["changes"][-1]["prompt"] == "purge"
 
 
 def test_memory_can_be_switched_off(tmp_path, monkeypatch):
     monkeypatch.setenv("BACKDATE_EDITOR_MEMORY", "off")
     st = EditorStore(tmp_path / "ed")
-    st.create(messy(), "a.dxf", fingerprint="offfp001")
-    assert st.create(messy(), "a.dxf", fingerprint="offfp001").previous is None
+    st.create(messy(), "a.dxf", fingerprint="offfp001", workspace=WS)
+    assert st.create(messy(), "a.dxf", fingerprint="offfp001", workspace=WS).previous is None
+
+
+def test_memory_is_private_to_a_workspace(store):
+    mine = store.create(messy(), "messy.dxf", fingerprint="privfp01", workspace=WS)
+    mine.accept(mine.stage([{"op": "purge_unused_layers"}], [], "local", "my secret change").id)
+    mine.remember("user", "confidential question")
+    mine.remember("assistant", "answer")
+    theirs = store.create(messy(), "messy.dxf", fingerprint="privfp01", workspace=WS2)
+    assert theirs.previous is None  # same file, different person: nothing shared
+    nobody = store.create(messy(), "messy.dxf", fingerprint="privfp01")
+    assert nobody.previous is None and nobody.memory is None and nobody.memory_key is None
+    assert store.memory.all(None) == [] and len(store.memory.all(mine.ws_tag)) == 1
+    assert store.create(messy(), "messy.dxf", fingerprint="privfp01", workspace=WS).previous["visits"] == 1
 
 
 # ── HTTP ────────────────────────────────────────────────────────────────────
@@ -309,10 +326,13 @@ def test_accept_chosen_steps_over_http(client):
 
 
 def test_memory_endpoints(client):
-    sid = client.post("/api/editor/sessions/sample").json()["id"]
+    h = {"X-Workspace": WS}
+    sid = client.post("/api/editor/sessions/sample", headers=h).json()["id"]
     p = client.post(f"/api/editor/sessions/{sid}/chat", json={"message": "purge unused layers"}).json()["proposal"]
     client.post(f"/api/editor/sessions/{sid}/proposals/{p['id']}/accept")
-    sid2 = client.post("/api/editor/sessions/sample").json()
+    assert client.post("/api/editor/sessions/sample").json()["memory"] is None  # no workspace key: nothing remembered
+    assert client.post("/api/editor/sessions/sample", headers={"X-Workspace": "bad"}).json()["memory"] is None
+    sid2 = client.post("/api/editor/sessions/sample", headers=h).json()
     assert sid2["memory"]["visits"] >= 1 and sid2["memory"]["changes"]
     mem = client.get(f"/api/editor/sessions/{sid2['id']}/memory").json()
     assert mem["remembered"] and mem["changes"][-1]["prompt"] == "purge unused layers"

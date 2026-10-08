@@ -301,6 +301,7 @@ class BatchJob:
     finished: Optional[float] = None
     zip_path: Optional[Path] = None
     report: str = ""
+    model: object = None
 
     def view(self) -> dict:
         done = len(self.results)
@@ -340,7 +341,7 @@ class BatchManager:
 
     def _run(self, job: BatchJob) -> None:
         job.status = "running"
-        model = self.model_factory() if job.recipe.get("ai_instruction") else None
+        model = (job.model or self.model_factory()) if job.recipe.get("ai_instruction") else None
         try:
             for i, f in enumerate(job.files):
                 use_model = model if i < BATCH_AI_LIMIT else None
