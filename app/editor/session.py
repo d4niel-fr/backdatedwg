@@ -227,7 +227,7 @@ class EditorSession:
             result, done = self._apply_steps(clone, steps, selection)
             t = result.touched
             if not result.summaries:
-                raise ops.OpError("There's nothing to change: " + "; ".join(result.warnings)[:300] if result.warnings else "There's nothing to change.")
+                raise ops.NothingToChange(("There's nothing to change: " + "; ".join(w.rstrip(". ") for w in result.warnings)[:300] + ".") if result.warnings else "There's nothing to change.")
             fresh = geometry.extract(clone, handles=t.changed | t.created).items if (t.changed or t.created) else []
             remove = sorted(t.deleted | t.changed)
             truncated = len(fresh) > PREVIEW_LIMIT

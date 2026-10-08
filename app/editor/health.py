@@ -209,7 +209,7 @@ def check(doc: Drawing, scene: Scene, units: Units, digest: dict) -> dict:
                                  len(heights), fix=_fix("Snap to the 3 most common", [{"op": "normalize_text_heights"}])))
     shx = [s.dxf.name for s in doc.styles if fnmatch.fnmatchcase(str(s.dxf.get("font", "")).lower(), "*.shx")]
     if shx:
-        findings.append(_finding("shx-fonts", "info", f"{len(shx)} text style{'s' if len(shx) != 1 else ''} use SHX fonts",
+        findings.append(_finding("shx-fonts", "info", f"{len(shx)} text style{'s use' if len(shx) != 1 else ' uses'} SHX fonts",
                                  "SHX fonts may be missing on other machines and aren't searchable in PDFs: " + ", ".join(shx[:8]) + ".",
                                  len(shx), fix=_fix("Switch to Arial", [{"op": "replace_fonts", "font": "arial.ttf"}])))
     if overrides and len(overrides) > 0.25 * max(1, len(msp)):
@@ -227,7 +227,7 @@ def check(doc: Drawing, scene: Scene, units: Units, digest: dict) -> dict:
                                  sum(l["count"] for l in hidden)))
     dims = _dimension_mismatches(doc)
     if dims:
-        findings.append(_finding("dimension-overrides", "error", f"{len(dims)} dimension{'s' if len(dims) != 1 else ''} show the wrong value",
+        findings.append(_finding("dimension-overrides", "error", f"{len(dims)} dimension{'s show' if len(dims) != 1 else ' shows'} the wrong value",
                                  "Typed-over dimension text that doesn't match what is drawn: " + "; ".join(f"says “{t}”, measures {units.show(m)}" for _, t, m in dims[:5]) + ".",
                                  len(dims), [d[0] for d in dims]))
     typos = spelling(doc)
@@ -237,7 +237,7 @@ def check(doc: Drawing, scene: Scene, units: Units, digest: dict) -> dict:
         for wrong, (right, _n, _hs) in sorted(typos.items())[:12]:
             fix_ops.append({"op": "replace_text", "find": wrong, "replace": right, "match_case_of_found": True, "optional": True})
         listed = ", ".join(f"{w} → {r}" for w, (r, _n, _h) in sorted(typos.items())[:8])
-        findings.append(_finding("spelling", "warn", f"{sum(n for _r, n, _h in typos.values())} spelling mistake{'s' if len(typos) != 1 else ''} in text",
+        findings.append(_finding("spelling", "warn", f"{(n_typos := sum(n for _r, n, _h in typos.values()))} spelling mistake{'s' if n_typos != 1 else ''} in text",
                                  f"Common misspellings found: {listed}. (Use the assistant for a full proofread.)",
                                  sum(n for _r, n, _h in typos.values()), handles, _fix("Correct them", fix_ops)))
     xrefs = [b for b in doc.blocks if b.block is not None and b.block.is_xref]

@@ -14,3 +14,5 @@ jobs:
       - run: python -m pytest -q
       - run: node --check static/app.js
       - run: node --check static/editor.js
+      - run: node --check static/editor-tools.js
+      - run: node --check static/editor-review.js

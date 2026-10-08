@@ -54,6 +54,10 @@ class OpError(ValueError):
     """An operation that can't be carried out. The message is written for the model and for people."""
 
 
+class NothingToChange(OpError):
+    """Every operation was valid but none of them found anything to change."""
+
+
 @dataclass
 class Touched:
     changed: set[str] = field(default_factory=set)
@@ -1338,7 +1342,7 @@ def apply_ops(doc: Drawing, ops: list, units: Units, selection: list[str], text_
             spec.fn(ctx, {k: v for k, v in raw.items() if k != "optional"})
         except OpError as e:
             if raw.get("optional") is True:  # "if there's anything to do": nothing to do is fine
-                out.warnings.append(f"Skipped {spec.name}: {str(e).removeprefix(spec.name + ': ')}")
+                out.warnings.append(f"Skipped {spec.name.replace('_', ' ')}: {str(e).removeprefix(spec.name + ': ').rstrip('. ')}")
                 continue
             raise OpError(f"Operation {i} ({spec.name}): {e}" if not str(e).startswith(spec.name) else f"Operation {i}: {e}") from e
     # An entity that was changed and then deleted (or created and deleted) is just deleted / nothing.

@@ -247,6 +247,9 @@ def test_cli(no_engines, messy_file, tmp_path, capsys):
     assert cli.main(["apply", str(messy_file), "--command", "purge unused layers", "--command", "delete duplicates", "--out", str(tmp_path / "o")]) == 0
     assert (tmp_path / "o" / "messy.dxf").exists() and "✓ purge unused layers" in (tmp_path / "o" / "report.txt").read_text()
     capsys.readouterr()
+    # --out ending in .dxf names the output file itself
+    assert cli.main(["apply", str(messy_file), "--command", "purge unused layers", "--target", "2010", "--out", str(tmp_path / "named" / "clean.dxf")]) == 0
+    assert ezdxf.readfile(tmp_path / "named" / "clean.dxf").acad_release == "R2010" and "wrote" in capsys.readouterr().out
     folder = tmp_path / "many"
     folder.mkdir()
     for n in ("x.dxf", "y.dxf"):
@@ -321,3 +324,8 @@ def test_recipe_endpoints(client):
     applied = client.post(f"/api/editor/sessions/{sid2}/recipe/apply", json={"recipe": {"commands": ["purge unused layers", "standardize layers"]}}).json()
     assert [st["title"] for st in applied["proposal"]["steps"]][0] == "purge unused layers"
     assert client.post(f"/api/editor/sessions/{sid2}/recipe/apply", json={"recipe": {"commands": ["dance"]}}).status_code == 422
+    # a recipe that finds nothing to do is an answer, not an error
+    p = applied["proposal"]
+    client.post(f"/api/editor/sessions/{sid2}/proposals/{p['id']}/accept", json={"steps": [0]})
+    again = client.post(f"/api/editor/sessions/{sid2}/recipe/apply", json={"recipe": {"commands": ["purge unused layers"]}})
+    assert again.status_code == 200 and again.json()["proposal"] is None and "no unused layers" in again.json()["message"]

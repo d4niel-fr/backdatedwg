@@ -172,6 +172,9 @@ def process_file(path: Path, recipe: dict, engines: Engines, work: Path, model=N
 
     for cmd in recipe["commands"]:
         plan = agent.local_plan(s, cmd)
+        if plan and not plan[0]:
+            rec["skipped"].append(f"{cmd}: nothing to do")
+            continue
         if plan:
             attempt(cmd, lambda plan=plan: s.stage([], [], "batch", cmd, steps=plan[0]))
             continue

@@ -125,6 +125,20 @@ def test_spelling_plan(tmp_path):
     assert "recieving → receiving" in r.reply and r.proposal
 
 
+def test_built_in_plans_with_nothing_to_do_answer_without_the_model(tmp_path):
+    doc = ezdxf.new("R2018")
+    doc.modelspace().add_line((0, 0), (10, 0))
+    doc.modelspace().add_text("RECEIVING")
+    s = EditorStore(tmp_path / "e").create(doc, "clean.dxf")
+    model = FakeModel()  # no replies queued: any call would fail the test
+    for msg, needle in [("clean up the drawing", "Nothing to clean up"),
+                        ("check spelling", "none of the common misspellings"),
+                        ("standardize layers", "layer")]:
+        r = agent.run(s, msg, [], model)
+        assert r.source == "local" and r.proposal is None and needle in r.reply, (msg, r.reply)
+    assert model.calls == []
+
+
 @pytest.mark.parametrize("cmd,op", [
     ("purge unused blocks", "purge_unused_blocks"),
     ("purge", "purge_unused_layers"),
@@ -341,6 +355,8 @@ def test_memory_endpoints(client):
 
 
 def test_empty_plan_is_refused(s):
+    from app.editor import ops
+
     s.accept(s.stage([{"op": "purge_unused_layers"}], [], "x").id)
-    with pytest.raises(Exception, match="nothing to change"):
+    with pytest.raises(ops.NothingToChange, match="nothing to change: Skipped purge unused layers: there are no unused layers\\.$"):
         s.stage([{"op": "purge_unused_layers", "optional": True}], [], "x")

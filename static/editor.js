@@ -1,5 +1,7 @@
-// Backdate.dwg AI editor: a drawing on the left, a conversation on the right.
+// Backdate.dwg AI editor: a drawing on the left, a conversation (and tools) on the right.
 // Edits arrive as proposals. They are previewed on the drawing and only applied when accepted.
+// This file is the core; editor-tools.js (the Tools tab) and editor-review.js (review links)
+// build on the small interface it publishes as window.ED.
 (() => {
   "use strict";
 
@@ -9,29 +11,73 @@
   const ACCENT = "#c67139";
   const DEL = "#c2410c";
   const ADD = "#3d7a3a";
+  const CHG = "#b7791f";
+  const AREA = "#0f766e";
   const DOC_YEAR = { AC1032: 2018, AC1027: 2013, AC1024: 2010, AC1021: 2007, AC1018: 2004, AC1015: 2000 };
+  const params = new URLSearchParams(location.search);
 
   const S = {
     config: null,
     session: null, // summary from the server
     scene: null, // { items, groups, texts, byHandle, hbox, extents }
     view: { cx: 0, cy: 0, scale: 1 },
+    viewSet: false,
     hidden: new Set(), // layers hidden in the viewer
     selected: new Set(),
     proposal: null, // pending proposal view (drives the preview overlay)
-    overlay: null, // { remove: Set, add: [items], b: bbox }
+    overlay: null, // { remove: Set, add: [items] }
     pending: false,
-    hover: null,
     boxMode: false,
+    areaMode: false,
+    area: null, // [x0, y0, x1, y1] in world units
     W: 0,
     H: 0,
     dpr: 1,
     dirty: false,
     marquee: null,
+    people: [], // others watching this session
+    cursors: {}, // client -> {x, y, name, color, t}
+    pins: [], // review comments with positions
+    readOnly: false,
   };
+  const hooks = { draw: [], adopt: [], open: [], close: [], event: [] };
 
   const cv = $("cv");
   const ctx = cv.getContext("2d");
+
+  // ── identity: workspace (private memory and search), name, access key ──
+  function local(key, value) {
+    try {
+      if (value === undefined) return localStorage.getItem(key);
+      if (value === null) localStorage.removeItem(key);
+      else localStorage.setItem(key, value);
+    } catch (e) { /* storage can be blocked; everything still works for this visit */ }
+    return null;
+  }
+  function randomId(n) {
+    const a = new Uint8Array(n);
+    crypto.getRandomValues(a);
+    return Array.from(a, (b) => "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_"[b & 63]).join("");
+  }
+  let memWorkspace = null;
+  function workspaceKey() {
+    let ws = local("bd-workspace");
+    if (!ws || !/^[A-Za-z0-9_-]{16,128}$/.test(ws)) {
+      ws = memWorkspace || randomId(24);
+      memWorkspace = ws;
+      local("bd-workspace", ws);
+    }
+    return ws;
+  }
+  const CLIENT = "c" + randomId(12);
+  function myName() { return local("bd-name") || ""; }
+  function accessKey() { return local("bd-access-key") || ""; }
+  function headers(extra) {
+    const h = { "X-Workspace": workspaceKey(), "X-Client-Id": CLIENT, "X-Client-Name": myName() || "" };
+    const k = accessKey();
+    if (k) h["X-Access-Token"] = k;
+    return Object.assign(h, extra || {});
+  }
 
   // ── helpers ─────────────────────────────────────────────────────────────
   function el(tag, cls, text) {
@@ -40,12 +86,18 @@
     if (text != null) e.textContent = text;
     return e;
   }
+  function btn(label, cls, onClick) {
+    const b = el("button", cls || "btn btn-secondary", label);
+    b.type = "button";
+    if (onClick) b.addEventListener("click", onClick);
+    return b;
+  }
   function store(key, value) {
     try {
       if (value === undefined) return sessionStorage.getItem(key);
       if (value === null) sessionStorage.removeItem(key);
       else sessionStorage.setItem(key, value);
-    } catch (e) { /* storage can be blocked; the editor works without it */ }
+    } catch (e) { /* optional */ }
     return null;
   }
   let toastTimer = 0;
@@ -57,8 +109,10 @@
     toastTimer = setTimeout(() => { t.hidden = true; }, 4500);
   }
   async function api(path, opts) {
+    const o = Object.assign({}, opts || {});
+    o.headers = headers(o.headers);
     let res;
-    try { res = await fetch(API + path, opts); } catch (e) { throw new Error("Can't reach the server. Check your connection and try again."); }
+    try { res = await fetch(API + path, o); } catch (e) { throw new Error("Can't reach the server. Check your connection and try again."); }
     if (res.status === 204) return null;
     let body = null;
     try { body = await res.json(); } catch (e) { /* not JSON */ }
@@ -66,6 +120,28 @@
     return body;
   }
   const post = (path, data) => api(path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(data || {}) });
+  async function download(path, fallbackName) {
+    // fetch (so headers such as an access key go along), then save the blob
+    let res;
+    try { res = await fetch(API + path, { headers: headers() }); } catch (e) { toast("Can't reach the server."); return; }
+    if (!res.ok) {
+      let msg = `Download failed (${res.status}).`;
+      try { const b = await res.json(); msg = (b.error && b.error.message) || msg; } catch (e) { /* binary */ }
+      toast(msg);
+      return;
+    }
+    const cd = res.headers.get("content-disposition") || "";
+    const m = /filename\*=UTF-8''([^;]+)|filename="?([^";]+)"?/i.exec(cd);
+    const name = m ? decodeURIComponent(m[1] || m[2]) : fallbackName || "download";
+    const url = URL.createObjectURL(await res.blob());
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = name;
+    document.body.append(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 30000);
+  }
   const sid = () => S.session && S.session.id;
   const fmt = (n) => Number(n).toLocaleString(undefined, { maximumFractionDigits: 1 });
 
@@ -124,13 +200,16 @@
     return { items: geo.items, groups, texts, byHandle, hbox, extents: geo.extents, truncated: geo.truncated, notShown: geo.notShown || {} };
   }
 
-  async function loadGeometry({ fit }) {
-    const geo = await api(`/api/editor/sessions/${sid()}/geometry`);
+  function setScene(geo, fit) {
     S.scene = buildScene(geo);
     for (const h of [...S.selected]) if (!S.scene.byHandle.has(h)) S.selected.delete(h);
     if (fit || !S.viewSet) fitView();
     updateSelection();
     requestDraw();
+  }
+
+  async function loadGeometry({ fit }) {
+    setScene(await api(`/api/editor/sessions/${sid()}/geometry`), fit);
   }
 
   // ── drawing ─────────────────────────────────────────────────────────────
@@ -161,15 +240,14 @@
     S.view.cx = (b[0] + b[2]) / 2;
     S.view.cy = (b[1] + b[3]) / 2;
     S.viewSet = true;
+    requestDraw();
   }
   function fitView() {
     const e = S.scene && S.scene.extents;
     if (e) fitTo(e); else { S.view = { cx: 0, cy: 0, scale: 1 }; S.viewSet = true; }
     requestDraw();
   }
-  function viewport() {
-    return [wx(0), wy(S.H), wx(S.W), wy(0)];
-  }
+  function viewport() { return [wx(0), wy(S.H), wx(S.W), wy(0)]; }
   const overlaps = (a, b) => !(a[2] < b[0] || a[0] > b[2] || a[3] < b[1] || a[1] > b[3]);
 
   function trace(it) {
@@ -179,7 +257,7 @@
     if (it.z) ctx.closePath();
   }
   function visible(it, vp, minPx) {
-    if (S.hidden.has(it.l)) return false;
+    if (it.l && S.hidden.has(it.l)) return false;
     const b = it.b;
     if (b[2] < vp[0] || b[0] > vp[2] || b[3] < vp[1] || b[1] > vp[3]) return false;
     return it.k !== "p" || (b[2] - b[0]) * S.view.scale >= minPx || (b[3] - b[1]) * S.view.scale >= minPx;
@@ -196,6 +274,16 @@
     lines.forEach((ln, i) => ctx.fillText(ln.slice(0, 120), 0, i * px * 1.3));
     ctx.restore();
   }
+  function strokeItems(items, color, width, dash, alpha) {
+    const vp = viewport();
+    ctx.strokeStyle = color; ctx.lineWidth = width; ctx.globalAlpha = alpha || 1; ctx.setLineDash(dash || []);
+    ctx.beginPath();
+    for (const it of items) if (it.k === "p" && visible(it, vp, 0.3)) trace(it);
+    ctx.stroke();
+    ctx.setLineDash([]); ctx.globalAlpha = 1;
+    for (const it of items) if (it.k === "t" && visible(it, vp, 0)) drawText(it, color);
+  }
+  const itemsOf = (handles) => { const out = []; for (const h of handles) for (const it of (S.scene.byHandle.get(h) || [])) out.push(it); return out; };
 
   function draw() {
     ctx.setTransform(S.dpr, 0, 0, S.dpr, 0, 0);
@@ -225,33 +313,68 @@
     }
 
     if (removed) {
-      ctx.strokeStyle = DEL; ctx.globalAlpha = 0.55; ctx.lineWidth = 2; ctx.setLineDash([6, 4]);
-      ctx.beginPath();
-      for (const h of removed) for (const it of sc.byHandle.get(h) || []) if (it.k === "p" && visible(it, vp, 0.3)) trace(it);
-      ctx.stroke();
-      ctx.setLineDash([]); ctx.globalAlpha = 1;
-      for (const h of removed) for (const it of sc.byHandle.get(h) || []) if (it.k === "t" && visible(it, vp, 0)) drawText(it, DEL);
-      ctx.strokeStyle = ADD; ctx.lineWidth = 2;
-      ctx.beginPath();
-      for (const it of S.overlay.add) if (it.k === "p" && visible({ ...it, l: "" }, vp, 0.3)) trace(it);
-      ctx.stroke();
-      for (const it of S.overlay.add) if (it.k === "t") drawText(it, ADD);
+      strokeItems(itemsOf(removed), DEL, 2, [6, 4], 0.55);
+      strokeItems(S.overlay.add, ADD, 2);
     }
+    for (const fn of hooks.draw) fn(ctx, { sx, sy, wx, wy, viewport, strokeItems, itemsOf, trace, drawText });
 
-    if (S.selected.size) {
-      ctx.strokeStyle = ACCENT; ctx.lineWidth = 2.5;
-      ctx.beginPath();
-      for (const h of S.selected) for (const it of sc.byHandle.get(h) || []) if (it.k === "p" && !S.hidden.has(it.l)) trace(it);
-      ctx.stroke();
-      for (const h of S.selected) for (const it of sc.byHandle.get(h) || []) if (it.k === "t" && !S.hidden.has(it.l)) drawText(it, ACCENT);
+    if (S.selected.size) strokeItems(itemsOf(S.selected).filter((it) => !S.hidden.has(it.l)), ACCENT, 2.5);
+
+    if (S.area) {
+      const [x0, y0, x1, y1] = S.area;
+      ctx.strokeStyle = AREA; ctx.lineWidth = 1.5; ctx.setLineDash([8, 5]);
+      ctx.fillStyle = "rgba(15,118,110,0.07)";
+      ctx.fillRect(sx(x0), sy(y1), sx(x1) - sx(x0), sy(y0) - sy(y1));
+      ctx.strokeRect(sx(x0), sy(y1), sx(x1) - sx(x0), sy(y0) - sy(y1));
+      ctx.setLineDash([]);
     }
+    drawPins();
+    drawCursors();
 
     if (S.marquee) {
       const m = S.marquee, crossing = m.x1 < m.x0;
       const x = Math.min(m.x0, m.x1), y = Math.min(m.y0, m.y1), w = Math.abs(m.x1 - m.x0), h = Math.abs(m.y1 - m.y0);
-      ctx.lineWidth = 1.25; ctx.setLineDash(crossing ? [5, 4] : []);
-      ctx.fillStyle = "rgba(198,113,57,0.10)"; ctx.strokeStyle = ACCENT;
+      ctx.lineWidth = 1.25;
+      ctx.setLineDash(m.area ? [8, 5] : crossing ? [5, 4] : []);
+      ctx.fillStyle = m.area ? "rgba(15,118,110,0.08)" : "rgba(198,113,57,0.10)";
+      ctx.strokeStyle = m.area ? AREA : ACCENT;
       ctx.fillRect(x, y, w, h); ctx.strokeRect(x, y, w, h); ctx.setLineDash([]);
+    }
+  }
+
+  function drawPins() {
+    S.pins.forEach((p, i) => {
+      if (p.x == null || p.y == null) return;
+      const x = sx(p.x), y = sy(p.y);
+      if (x < -20 || y < -20 || x > S.W + 20 || y > S.H + 20) return;
+      ctx.beginPath();
+      ctx.moveTo(x, y);
+      ctx.arc(x, y - 16, 11, Math.PI * 0.75, Math.PI * 2.25);
+      ctx.closePath();
+      ctx.fillStyle = p.resolved ? "#a19786" : (p.owner ? "#7a8a5e" : ACCENT);
+      ctx.fill();
+      ctx.fillStyle = "#fff";
+      ctx.font = "600 11px Figtree, system-ui, sans-serif";
+      ctx.textAlign = "center";
+      ctx.fillText(String(p.n || i + 1), x, y - 12);
+      ctx.textAlign = "start";
+    });
+  }
+  function drawCursors() {
+    const now = Date.now();
+    for (const c of Object.values(S.cursors)) {
+      if (c.x == null || now - c.t > 20000) continue;
+      const x = sx(c.x), y = sy(c.y);
+      ctx.fillStyle = c.color;
+      ctx.beginPath();
+      ctx.moveTo(x, y); ctx.lineTo(x + 3, y + 15); ctx.lineTo(x + 7, y + 10); ctx.lineTo(x + 13, y + 11); ctx.closePath();
+      ctx.fill();
+      ctx.font = "600 11px Figtree, system-ui, sans-serif";
+      const label = c.name || "Guest";
+      const w = ctx.measureText(label).width + 10;
+      ctx.fillRect(x + 12, y + 12, w, 17);
+      ctx.fillStyle = "#fff";
+      ctx.fillText(label, x + 17, y + 25);
     }
   }
 
@@ -287,6 +410,13 @@
     }
     return best;
   }
+  function pickPin(px, py) {
+    for (const p of S.pins) {
+      if (p.x == null) continue;
+      if (Math.hypot(sx(p.x) - px, sy(p.y) - 16 - py) < 12) return p;
+    }
+    return null;
+  }
 
   function describeHandles(handles) {
     const types = new Map(), layers = new Set();
@@ -304,8 +434,11 @@
     const n = S.selected.size;
     $("selchip").hidden = n === 0;
     $("st-sel").textContent = n ? `${fmt(n)} selected` : "";
-    if (n) $("selchip-text").textContent = `${fmt(n)} selected — ${describeHandles(S.selected)}`;
-    $("input").placeholder = n ? "What should happen to the selection?  e.g. “move it 2 m north”" : "Describe a change…  e.g. “move layer S-RACK 2 m east”";
+    if (n && S.scene) $("selchip-text").textContent = `${fmt(n)} selected — ${describeHandles(S.selected)}`;
+    $("input").placeholder = n ? "What should happen to the selection?  e.g. “move it 2 m north”, “what is this?”"
+      : S.area ? "Ask about the marked area…  e.g. “what's in this area?”"
+        : "Describe a change…  e.g. “move layer S-RACK 2 m east”";
+    sendPresence();
   }
   function setSelection(handles, add) {
     if (!add) S.selected.clear();
@@ -313,25 +446,49 @@
     updateSelection();
     requestDraw();
   }
+  function selectAndShow(handles) {
+    if (!S.scene || !handles || !handles.length) return;
+    setSelection(handles.filter((h) => S.scene.byHandle.has(h)), false);
+    const boxes = handles.map((h) => S.scene.hbox.get(h)).filter(Boolean);
+    if (boxes.length) fitTo(boxes.reduce((a, b) => [Math.min(a[0], b[0]), Math.min(a[1], b[1]), Math.max(a[2], b[2]), Math.max(a[3], b[3])]), 0.25);
+  }
+  function setArea(box) {
+    S.area = box;
+    $("areachip").hidden = !box;
+    if (box) {
+      const u = unitShort();
+      $("areachip-text").textContent = `Area marked: ${fmt(box[2] - box[0])} × ${fmt(box[3] - box[1])} ${u} — your next questions are about this area`;
+    }
+    updateSelection();
+    requestDraw();
+  }
 
   // ── pointer interaction ────────────────────────────────────────────────
   let drag = null;
+  let hoverQueued = false;
+  function unitShort() {
+    const u = S.session && S.session.digest && S.session.digest.units;
+    return u ? u.short : "";
+  }
   cv.addEventListener("pointerdown", (e) => {
     if (!S.scene || (e.button !== 0 && e.button !== 1)) return;
     cv.setPointerCapture(e.pointerId);
     cv.focus({ preventScroll: true });
     const r = cv.getBoundingClientRect();
     const x = e.clientX - r.left, y = e.clientY - r.top;
-    drag = { x, y, lx: x, ly: y, moved: false, box: e.button === 0 && (e.shiftKey || S.boxMode), shift: e.shiftKey || e.ctrlKey || e.metaKey };
-    if (drag.box) S.marquee = { x0: x, y0: y, x1: x, y1: y };
+    const area = e.button === 0 && (e.altKey || S.areaMode);
+    drag = { x, y, lx: x, ly: y, moved: false, area, box: e.button === 0 && !area && (e.shiftKey || S.boxMode), shift: e.shiftKey || e.ctrlKey || e.metaKey };
+    if (drag.box || drag.area) S.marquee = { x0: x, y0: y, x1: x, y1: y, area };
   });
   cv.addEventListener("pointermove", (e) => {
     const r = cv.getBoundingClientRect();
     const x = e.clientX - r.left, y = e.clientY - r.top;
-    $("st-coords").textContent = S.scene ? `X ${fmt(wx(x))}   Y ${fmt(wy(y))}` + unitSuffix() : "";
+    $("st-coords").textContent = S.scene ? `X ${fmt(wx(x))}   Y ${fmt(wy(y))} ${unitShort()}` : "";
+    S.mouse = { x: wx(x), y: wy(y) };
+    sendPresence();
     if (drag) {
       if (!drag.moved && Math.hypot(x - drag.x, y - drag.y) > 4) drag.moved = true;
-      if (drag.box) { S.marquee.x1 = x; S.marquee.y1 = y; requestDraw(); }
+      if (drag.box || drag.area) { S.marquee.x1 = x; S.marquee.y1 = y; requestDraw(); }
       else if (drag.moved) {
         S.view.cx -= (x - drag.lx) / S.view.scale;
         S.view.cy += (y - drag.ly) / S.view.scale;
@@ -345,26 +502,29 @@
       hoverQueued = true;
       requestAnimationFrame(() => {
         hoverQueued = false;
+        const pin = pickPin(x, y);
+        if (pin) { $("st-hover").textContent = `Comment by ${pin.author}: ${pin.text}`; return; }
         const it = pick(wx(x), wy(y), 6);
         $("st-hover").textContent = it ? `${it.t} · layer ${it.l} · handle ${it.h}` : "";
       });
     }
   });
-  let hoverQueued = false;
-  function unitSuffix() {
-    const u = S.session && S.session.digest && S.session.digest.units;
-    return u ? " " + u.short : "";
-  }
   function endDrag(e) {
     if (!drag) return;
     const d = drag;
     drag = null;
     cv.classList.remove("panning");
-    if (d.box) {
+    if (d.box || d.area) {
       const m = S.marquee;
       S.marquee = null;
       if (d.moved) {
         const b = [Math.min(wx(m.x0), wx(m.x1)), Math.min(wy(m.y0), wy(m.y1)), Math.max(wx(m.x0), wx(m.x1)), Math.max(wy(m.y0), wy(m.y1))];
+        if (d.area) {
+          setArea(b);
+          if (S.areaMode) toggleArea(false);
+          $("input").focus();
+          return;
+        }
         const crossing = m.x1 < m.x0; // right-to-left touches; left-to-right must enclose (like CAD)
         const hits = [];
         for (const [h, hb] of S.scene.hbox) {
@@ -377,6 +537,9 @@
       }
     }
     if (!d.moved && e && e.type === "pointerup") {
+      const pin = pickPin(d.x, d.y);
+      if (pin) { hooks.event.forEach((fn) => fn("pin-click", pin)); return; }
+      if (S.pinMode && S.onPin) { S.onPin(wx(d.x), wy(d.y)); return; }
       const it = pick(wx(d.x), wy(d.y), 7);
       if (it) {
         if (d.shift && S.selected.has(it.h)) { S.selected.delete(it.h); updateSelection(); requestDraw(); }
@@ -403,16 +566,56 @@
   cv.addEventListener("keydown", (e) => {
     if (e.key === "f" || e.key === "F") fitView();
     else if (e.key === "b" || e.key === "B") toggleBox();
-    else if (e.key === "Escape") { setSelection([], false); }
-    else if ((e.key === "Delete" || e.key === "Backspace") && S.selected.size) { e.preventDefault(); send("delete the selection"); }
+    else if (e.key === "a" || e.key === "A") toggleArea();
+    else if (e.key === "Escape") { setSelection([], false); setArea(null); }
+    else if ((e.key === "Delete" || e.key === "Backspace") && S.selected.size && !S.readOnly) { e.preventDefault(); send("delete the selection"); }
   });
 
   function toggleBox() {
     S.boxMode = !S.boxMode;
+    if (S.boxMode && S.areaMode) toggleArea(false);
     $("box-btn").setAttribute("aria-pressed", String(S.boxMode));
   }
+  function toggleArea(force) {
+    S.areaMode = force === undefined ? !S.areaMode : force;
+    if (S.areaMode && S.boxMode) toggleBox();
+    $("area-btn").setAttribute("aria-pressed", String(S.areaMode));
+    if (S.areaMode) toast("Drag a box around the area you want to ask about.");
+  }
   $("box-btn").addEventListener("click", toggleBox);
+  $("area-btn").addEventListener("click", () => toggleArea());
   $("fit-btn").addEventListener("click", fitView);
+  $("areachip-clear").addEventListener("click", () => setArea(null));
+
+  // ── find ───────────────────────────────────────────────────────────────
+  $("find-form").addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const q = $("find-input").value.trim();
+    const box = $("find-results");
+    if (!q || !sid()) { box.hidden = true; return; }
+    try {
+      const r = await api(`/api/editor/sessions/${sid()}/find?q=${encodeURIComponent(q)}`);
+      box.replaceChildren();
+      if (!r.results.length) box.append(el("li", "muted small", "Nothing found."));
+      r.results.slice(0, 60).forEach((x) => {
+        const li = el("li");
+        const b = btn(`${x.label}`, "ed-find-hit");
+        b.prepend(el("span", "tag tag-neutral", x.kind));
+        b.append(el("span", "muted small", ` ${x.layer}`));
+        b.addEventListener("click", () => { selectAndShow([x.handle]); box.hidden = true; });
+        li.append(b);
+        box.append(li);
+      });
+      if (r.count > 60) box.append(el("li", "muted small", `…and ${fmt(r.count - 60)} more.`));
+      if (r.count > 1) {
+        const li = el("li");
+        li.append(btn(`Select all ${fmt(Math.min(r.count, 500))}`, "btn btn-ghost", () => { selectAndShow(r.results.map((x) => x.handle)); box.hidden = true; }));
+        box.append(li);
+      }
+      box.hidden = false;
+    } catch (err) { toast(err.message); }
+  });
+  document.addEventListener("click", (e) => { if (!e.target.closest("#find-results") && !e.target.closest("#find-form")) $("find-results").hidden = true; });
 
   // ── layers popover ─────────────────────────────────────────────────────
   function renderLayers() {
@@ -461,83 +664,278 @@
   function setComposer(enabled) {
     $("input").disabled = !enabled;
     $("send-btn").disabled = !enabled;
+    $("mic-btn").disabled = !enabled;
   }
   function setPending(on) {
     S.pending = on;
-    setComposer(!on && !!S.session);
+    setComposer(!on && !!S.session && !S.readOnly);
     for (const b of document.querySelectorAll(".prop-actions button")) b.disabled = on;
     $("undo-btn").disabled = on || !(S.session && S.session.canUndo);
     $("redo-btn").disabled = on || !(S.session && S.session.canRedo);
   }
 
-  async function send(text) {
-    text = (text || "").trim();
-    if (!text || !S.session || S.pending) return;
-    addMsg("user", text);
-    $("suggest").replaceChildren();
-    const think = el("div", "msg bot think");
-    think.append(el("span", "spinner"), el("span", null, "Thinking…"));
-    log.append(think);
+  function sourceLabel(r) {
+    if (r.source === "model") return r.queries ? `AI assistant · looked things up ${r.queries}×` : "AI assistant";
+    if (r.source === "local") return "Built-in";
+    return "";
+  }
+
+  // Render a structured answer (tables, health report, inspection) under a message.
+  function renderData(data) {
+    if (!data) return;
+    const box = el("div", "msg-data");
+    if (data.kind === "table") {
+      const head = el("div", "md-head");
+      head.append(el("strong", null, data.title || "Table"));
+      if (data.download) head.append(btn("Download CSV", "btn btn-ghost", () => download(data.download, "table.csv")));
+      if (data.handles && data.handles.length) head.append(btn("Show on drawing", "btn btn-ghost", () => selectAndShow(data.handles)));
+      box.append(head, tableEl(data.columns, data.rows, 25));
+    } else if (data.kind === "health") {
+      box.append(healthEl(data.report));
+    } else if (data.kind === "inspect") {
+      const it = data.items[0];
+      if (it) {
+        const dl = el("dl", "md-kv");
+        for (const [k, v] of Object.entries(it)) {
+          if (["sentence", "handle"].includes(k) || v == null || v === "") continue;
+          dl.append(el("dt", null, k), el("dd", null, typeof v === "object" ? (Array.isArray(v) ? v.map((x) => (typeof x === "number" ? fmt(x) : x)).join(", ") : Object.entries(v).map(([a, b]) => `${a}=${b}`).join(", ")) : typeof v === "number" ? fmt(v) : String(v)));
+        }
+        box.append(dl);
+      }
+    } else if (data.kind === "area") {
+      const s = data.summary;
+      if (s.handles && s.handles.length) box.append(btn(`Select these ${fmt(s.count)}`, "btn btn-ghost", () => selectAndShow(s.handles)));
+    } else return;
+    log.append(box);
     scrollDown();
+  }
+  function tableEl(columns, rows, limit) {
+    const wrap = el("div", "md-table");
+    const t = el("table", "table");
+    const thead = el("thead");
+    const tr = el("tr");
+    columns.forEach((c) => tr.append(el("th", null, c)));
+    thead.append(tr);
+    const tbody = el("tbody");
+    const fill = (n) => {
+      tbody.replaceChildren();
+      rows.slice(0, n).forEach((r) => {
+        const row = el("tr");
+        r.forEach((c) => row.append(el("td", null, typeof c === "number" ? fmt(c) : String(c))));
+        tbody.append(row);
+      });
+    };
+    fill(limit);
+    t.append(thead, tbody);
+    wrap.append(t);
+    if (rows.length > limit) {
+      const more = btn(`Show all ${fmt(rows.length)} rows`, "btn btn-ghost", () => { fill(rows.length); more.remove(); });
+      wrap.append(more);
+    }
+    return wrap;
+  }
+  function healthEl(report) {
+    const box = el("div", "md-health");
+    const head = el("div", "md-head");
+    const score = el("span", "md-score " + (report.score >= 90 ? "ok" : report.score >= 70 ? "mid" : "bad"), String(report.score));
+    head.append(score, el("strong", null, report.findings.length ? `${report.findings.length} thing${report.findings.length === 1 ? "" : "s"} to look at` : "Nothing to tidy"));
+    if (report.fixAll && !S.readOnly) head.append(btn(report.fixAll.label, "btn btn-primary", () => stageOps(report.fixAll.ops, "Fix everything safe")));
+    box.append(head);
+    const ul = el("ul", "md-findings");
+    for (const f of report.findings) {
+      const li = el("li", "sev-" + f.severity);
+      li.append(el("strong", null, f.title), el("p", "muted small", f.detail));
+      const row = el("div", "row");
+      if (f.handles && f.handles.length) row.append(btn("Show", "btn btn-ghost", () => selectAndShow(f.handles)));
+      if (f.fix && !S.readOnly) row.append(btn(f.fix.label, "btn btn-secondary", () => stageOps(f.fix.ops, f.title)));
+      if (row.children.length) li.append(row);
+      ul.append(li);
+    }
+    box.append(ul);
+    return box;
+  }
+
+  async function stageOps(ops, title) {
+    if (!sid() || S.pending) return;
+    selectTab("chat");
     setPending(true);
     try {
-      const r = await post(`/api/editor/sessions/${sid()}/chat`, { message: text, selection: [...S.selected].slice(0, 5000) });
-      think.remove();
-      const src = r.source === "model" ? (r.queries ? `AI assistant · looked things up ${r.queries}×` : "AI assistant") : r.source === "local" ? "Built-in command" : "";
-      addMsg("bot" + (r.error && !r.proposal ? " err" : ""), r.reply, src);
-      if (r.proposal) showProposal(r.proposal);
-      updateAiPill(r.aiCallsLeft);
-    } catch (err) {
-      think.remove();
-      addMsg("bot err", err.message);
-    } finally {
-      setPending(false);
-      $("input").focus();
+      const r = await post(`/api/editor/sessions/${sid()}/stage`, { ops, selection: [...S.selected].slice(0, 5000) });
+      addMsg("sys", `Proposed: ${title}`);
+      showProposal(r.proposal);
+    } catch (err) { addMsg("bot err", err.message); } finally { setPending(false); }
+  }
+
+  function renderSuggestions(list) {
+    const box = $("suggest");
+    box.replaceChildren();
+    for (const t of (list || []).slice(0, 5)) {
+      const b = el("button", null, t);
+      b.type = "button";
+      b.addEventListener("click", () => send(t));
+      box.append(b);
     }
   }
 
+  function finishReply(r, bubble) {
+    const text = r.reply || "";
+    const kind = "bot" + (r.error && !r.proposal ? " err" : "");
+    if (bubble) {
+      bubble.className = "msg " + kind;
+      bubble.replaceChildren(document.createTextNode(text));
+      const src = sourceLabel(r);
+      if (src) bubble.append(el("span", "src", src));
+    } else addMsg(kind, text, sourceLabel(r));
+    renderData(r.data);
+    if (r.proposal) showProposal(r.proposal);
+    renderSuggestions(r.suggestions);
+    hooks.event.forEach((fn) => fn("reply", r));
+  }
+
+  async function send(text) {
+    text = (text || "").trim();
+    if (!text || !S.session || S.pending || S.readOnly) return;
+    addMsg("user", text);
+    $("suggest").replaceChildren();
+    const think = el("div", "msg bot think");
+    const status = el("span", null, "Thinking…");
+    think.append(el("span", "spinner"), status);
+    log.append(think);
+    scrollDown();
+    setPending(true);
+    const body = { message: text, selection: [...S.selected].slice(0, 5000) };
+    if (S.area) body.area = S.area;
+    try {
+      const done = await streamChat(body, think, status);
+      if (!done) { // fallback: one request, one answer
+        const r = await post(`/api/editor/sessions/${sid()}/chat`, body);
+        finishReply(r, think);
+      }
+      updateAiPill();
+    } catch (err) {
+      think.className = "msg bot err";
+      think.replaceChildren(document.createTextNode(err.message));
+    } finally {
+      setPending(false);
+      focusInput();
+    }
+  }
+
+  // Server-sent events over fetch: status lines, the reply as it is written, then the result.
+  async function streamChat(body, think, status) {
+    let res;
+    try {
+      res = await fetch(`${API}/api/editor/sessions/${sid()}/chat/stream`, { method: "POST", headers: headers({ "Content-Type": "application/json" }), body: JSON.stringify(body) });
+    } catch (e) { return false; }
+    if (!res.ok || !res.body || !res.body.getReader) return false;
+    const reader = res.body.getReader();
+    const dec = new TextDecoder();
+    let buf = "";
+    let live = null;
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buf += dec.decode(value, { stream: true });
+      let idx;
+      while ((idx = buf.indexOf("\n\n")) >= 0) {
+        const block = buf.slice(0, idx);
+        buf = buf.slice(idx + 2);
+        let kind = null, data = null;
+        for (const line of block.split("\n")) {
+          if (line.startsWith("event:")) kind = line.slice(6).trim();
+          else if (line.startsWith("data:")) { try { data = JSON.parse(line.slice(5)); } catch (e) { data = null; } }
+        }
+        if (!kind) continue;
+        if (kind === "status" && typeof data === "string") status.textContent = data;
+        else if (kind === "reply" && typeof data === "string") {
+          if (!live) { live = el("span", "live"); think.className = "msg bot"; think.replaceChildren(live); }
+          live.textContent = data;
+          scrollDown();
+        } else if (kind === "result") { finishReply(data, think); return true; }
+        else if (kind === "error") { throw new Error((data && data.message) || "Something went wrong."); }
+      }
+    }
+    return false;
+  }
+
   // ── proposals ──────────────────────────────────────────────────────────
+  const cards = new Map(); // proposal id -> card
   let activeCard = null;
-  function showProposal(p) {
+  function showProposal(p, from) {
     if (activeCard) retire(activeCard, "Replaced by a newer suggestion", "no");
     S.proposal = p;
     S.overlay = { remove: new Set(p.preview.remove), add: p.preview.add.map(prep) };
     const card = el("div", "prop");
     const head = el("div", "prop-head");
-    head.append(el("span", "tag tag-accent", "Proposed change"));
+    head.append(el("span", "tag tag-accent", from ? `Proposed by ${from}` : "Proposed change"));
     const st = p.stats, bits = [];
     if (st.changed) bits.push(`${fmt(st.changed)} changed`);
     if (st.removed) bits.push(`${fmt(st.removed)} removed`);
     if (st.added) bits.push(`${fmt(st.added)} added`);
-    if (st.tables && !bits.length) bits.push("layer settings");
+    if (st.tables && !bits.length) bits.push("settings only");
     head.append(el("span", "prop-stats", bits.join(" · ")));
     card.append(head);
-    const ul = el("ul");
-    p.summaries.forEach((s) => ul.append(el("li", null, s)));
-    for (const w of p.warnings) ul.append(el("li", "warn", "Heads-up: " + w));
-    if (p.preview.truncated) ul.append(el("li", "warn", "The preview on the drawing is partial because the change is very large."));
-    card.append(ul);
+    const checks = [];
+    if (p.steps && p.steps.length > 1) {
+      const ol = el("ol", "prop-steps");
+      p.steps.forEach((s, i) => {
+        const li = el("li");
+        const lab = el("label");
+        const cb = el("input");
+        cb.type = "checkbox";
+        cb.checked = true;
+        cb.addEventListener("change", () => { yes.textContent = checks.every((c) => c.checked) ? "Accept" : `Accept ${checks.filter((c) => c.checked).length} of ${checks.length}`; });
+        checks.push(cb);
+        lab.append(cb, el("strong", null, s.title || `Step ${i + 1}`));
+        li.append(lab);
+        const ul = el("ul");
+        s.summaries.forEach((x) => ul.append(el("li", null, x)));
+        li.append(ul);
+        ol.append(li);
+      });
+      card.append(ol);
+    } else {
+      const ul = el("ul");
+      p.summaries.forEach((s) => ul.append(el("li", null, s)));
+      card.append(ul);
+    }
+    const warn = el("ul", "prop-warn");
+    for (const w of p.warnings) warn.append(el("li", "warn", (w.startsWith("Skipped") ? "" : "Heads-up: ") + w));
+    if (p.preview.truncated) warn.append(el("li", "warn", "The preview on the drawing is partial because the change is very large."));
+    if (warn.children.length) card.append(warn);
+    if (p.why) {
+      const why = el("details", "prop-why");
+      why.append(el("summary", null, "Why this?"), el("p", null, p.why));
+      card.append(why);
+    }
     const det = el("details");
-    det.append(el("summary", null, "Show the exact operations"), el("pre", null, JSON.stringify(p.ops, null, 2)));
+    det.append(el("summary", null, "Show the exact operations"), el("pre", null, JSON.stringify(p.steps && p.steps.length > 1 ? p.steps.map((s) => ({ title: s.title, ops: s.ops })) : p.ops, null, 2)));
     card.append(det);
     const actions = el("div", "prop-actions");
-    const yes = el("button", "btn btn-primary", "Accept");
-    const no = el("button", "btn btn-secondary", "Reject");
-    const show = el("button", "btn btn-ghost", "Show on drawing");
-    yes.type = no.type = show.type = "button";
-    yes.addEventListener("click", () => accept(card, p));
-    no.addEventListener("click", () => reject(card, p));
-    show.addEventListener("click", () => focusOverlay(true));
+    const yes = btn("Accept", "btn btn-primary", () => accept(card, p, checks));
+    const no = btn("Reject", "btn btn-secondary", () => reject(card, p));
+    const show = btn("Show on drawing", "btn btn-ghost", () => focusOverlay(true));
     actions.append(yes, no);
     if (S.overlay.remove.size || S.overlay.add.length) actions.append(show);
+    if (S.readOnly) { yes.disabled = true; no.disabled = true; }
     card.append(actions);
-    card._p = p;
     activeCard = card;
+    cards.set(p.id, card);
     log.append(card);
     scrollDown();
-    $("legend").hidden = !(S.overlay.remove.size || S.overlay.add.length);
+    showLegend(S.overlay.remove.size || S.overlay.add.length ? "proposal" : null);
     focusOverlay(false);
     requestDraw();
+  }
+  function showLegend(kind) {
+    const lg = $("legend");
+    lg.hidden = !kind;
+    if (!kind) return;
+    const cmp = kind === "compare";
+    $("legend-del").textContent = cmp ? "removed (in the older revision)" : "will be removed or moved";
+    $("legend-add").textContent = cmp ? "added" : "new position / added";
+    $("legend-chg-wrap").hidden = !cmp;
+    $("legend-close").hidden = !cmp;
   }
   function overlayBox() {
     const sc = S.scene, boxes = [];
@@ -553,18 +951,24 @@
     requestDraw();
   }
   function retire(card, text, kind) {
+    if (!card || card.classList.contains("done")) return;
     card.classList.add("done");
     const actions = card.querySelector(".prop-actions");
     if (actions) actions.replaceWith(el("div", "prop-state " + kind, text));
-    if (activeCard === card) { activeCard = null; S.proposal = null; S.overlay = null; $("legend").hidden = true; }
+    card.querySelectorAll(".prop-steps input").forEach((c) => { c.disabled = true; });
+    if (activeCard === card) { activeCard = null; S.proposal = null; S.overlay = null; showLegend(null); }
     requestDraw();
   }
-  async function accept(card, p) {
+  async function accept(card, p, checks) {
     setPending(true);
     try {
-      const r = await post(`/api/editor/sessions/${sid()}/proposals/${p.id}/accept`);
-      retire(card, `Applied (change ${r.summary.rev})`, "ok");
+      const chosen = checks && checks.length ? checks.map((c, i) => (c.checked ? i : -1)).filter((i) => i >= 0) : null;
+      if (chosen && !chosen.length) { toast("Tick at least one step, or reject the proposal."); return; }
+      const body = chosen && chosen.length < checks.length ? { steps: chosen } : {};
+      const r = await post(`/api/editor/sessions/${sid()}/proposals/${p.id}/accept`, body);
+      retire(card, `Applied (change ${r.summary.rev})` + (body.steps ? ` · ${body.steps.length} of ${checks.length} steps` : ""), "ok");
       await adopt(r.summary, { fit: false });
+      renderSuggestions(r.suggestions);
       toast("Change applied. You can undo it.");
     } catch (err) {
       addMsg("bot err", err.message);
@@ -587,53 +991,63 @@
     renderChanges();
     setPending(S.pending);
     await loadGeometry({ fit });
+    hooks.adopt.forEach((fn) => fn(summary));
+  }
+  async function refresh() {
+    if (!sid()) return;
+    try { await adopt(await api(`/api/editor/sessions/${sid()}`), { fit: false }); } catch (e) { /* the next action reports it */ }
   }
 
-  function suggestions() {
-    const s = ["What's in this drawing?", "List layers", "Purge unused layers"];
+  function startSuggestions() {
+    const s = ["What's in this drawing?", "Health check", "Clean up the drawing", "Explain this drawing"];
     if (S.config && S.config.ai.enabled) s.push("Find anything unusual or messy in this drawing");
-    return s;
-  }
-  function renderSuggestions() {
-    const box = $("suggest");
-    box.replaceChildren();
-    for (const t of suggestions()) {
-      const b = el("button", null, t);
-      b.type = "button";
-      b.addEventListener("click", () => send(t));
-      box.append(b);
-    }
+    renderSuggestions(s);
   }
 
-  async function openSummary(summary, fresh) {
+  async function openSummary(summary, fresh, joined) {
     show("drawing");
     store("ed-session", summary.id);
     S.hidden = new Set(summary.digest.layers.filter((l) => !l.on).map((l) => l.name));
     S.selected.clear();
     S.viewSet = false;
+    S.area = null;
+    $("areachip").hidden = true;
+    $("find-input").value = "";
+    $("find-results").hidden = true;
     log.replaceChildren();
-    S.proposal = null; S.overlay = null; activeCard = null;
-    $("legend").hidden = true;
+    S.proposal = null; S.overlay = null; activeCard = null; cards.clear();
+    showLegend(null);
+    selectTab("chat");
     await adopt(summary, { fit: true });
     const d = summary.digest;
     const size = d.sizeMetres ? `about ${fmt(d.sizeMetres[0])} × ${fmt(d.sizeMetres[1])} m` : "size unknown";
-    let intro = `${fresh ? "Opened" : "Back in"} ${summary.name}: ${fmt(d.entityCount)} entities on ${fmt(d.layerCount)} layers, ${size}. Units: ${d.units.name}${d.units.guessed ? " (guessed, the file doesn't say)" : ""}.`;
+    let intro = `${joined ? "Joined" : fresh ? "Opened" : "Back in"} ${summary.name}: ${fmt(d.entityCount)} entities on ${fmt(d.layerCount)} layers, ${size}. Units: ${d.units.name}${d.units.guessed ? " (guessed, the file doesn't say)" : ""}.`;
     const ns = Object.entries(d.notShown || {});
     if (ns.length) intro += ` Not drawn here: ${ns.map(([k, v]) => `${k} ×${fmt(v)}`).join(", ")}.`;
     if (d.truncated) intro += " Very large drawing: only part of it is shown.";
     addMsg("bot", intro);
     for (const n of summary.notes || []) addMsg("sys", n);
-    addMsg("sys", "Click things on the drawing to select them, or just describe a change. I'll show you the result before anything is applied.");
-    renderSuggestions();
+    const mem = summary.memory;
+    if (mem && mem.changes && mem.changes.length) {
+      const last = mem.changes[mem.changes.length - 1];
+      addMsg("bot", `Welcome back: you've opened this drawing ${mem.visits} time${mem.visits === 1 ? "" : "s"} before. Last time: ${last.summaries.join("; ")}` + (last.prompt ? ` (you asked “${last.prompt}”).` : "."), "Remembered in your workspace");
+    }
+    addMsg("sys", "Click things on the drawing to select them, Alt-drag to mark an area, or just describe a change. I'll show you the result before anything is applied.");
+    startSuggestions();
     setComposer(true);
-    $("input").focus();
+    focusInput();
+    connectEvents();
+    hooks.open.forEach((fn) => fn(summary, { fresh, joined }));
   }
 
+  const coarse = window.matchMedia && window.matchMedia("(pointer: coarse)").matches;
+  function focusInput() { if (!coarse) $("input").focus(); }
   function show(which) {
     const drawing = which === "drawing";
+    document.body.classList.toggle("has-drawing", drawing);
     $("empty").hidden = drawing;
     $("canvas-wrap").hidden = !drawing;
-    $("top-actions").hidden = !drawing;
+    $("top-actions").hidden = !drawing || S.readOnly;
     $("file-name").hidden = !drawing;
     if (drawing) resize();
   }
@@ -647,14 +1061,42 @@
     $("drop-error-msg").textContent = msg || "";
     $("drop").dataset.state = msg ? "error" : "empty";
   }
-  async function openFile(file) {
+  let pendingImport = null;
+  function openFile(file) {
     if (!file) return;
     dropError("");
-    if (!/\.(dwg|dxf)$/i.test(file.name)) return dropError("Only .dwg and .dxf files can be opened.");
+    const name = file.name.toLowerCase();
+    if (/\.(dwg|dxf|wdp|json)$/.test(name)) return upload(file, {});
+    if (/\.pdf$/.test(name) || /\.(png|jpe?g|webp)$/.test(name)) {
+      pendingImport = file;
+      const pdf = /\.pdf$/.test(name);
+      $("import-opts").hidden = false;
+      $("import-pdf").hidden = !pdf;
+      $("import-sketch").hidden = pdf;
+      $("import-title").textContent = pdf ? `Import ${file.name} (vector PDF)` : `Trace ${file.name} with AI`;
+      $("import-note").textContent = pdf
+        ? "Lines, curves and text are imported. For a plan printed at 1:100, enter 100 to get real sizes; leave 1 for paper size."
+        : (S.config && S.config.ai.vision ? "A vision model traces walls, doors and labels. Check the result against the photo." : "Tracing a sketch needs the AI assistant with a vision model; it isn't connected on this server.");
+      $("import-go").focus();
+      return;
+    }
+    dropError("Open a .dwg or .dxf drawing, or import a .pdf plan, a sketch image (.png/.jpg) or a .wdp project.");
+  }
+  $("import-go").addEventListener("click", () => {
+    const f = pendingImport;
+    if (!f) return;
+    $("import-opts").hidden = true;
+    pendingImport = null;
+    const fields = /\.pdf$/i.test(f.name) ? { page: $("import-page").value || "1", scale: $("import-scale").value || "1" } : { width_m: $("import-width").value || "0" };
+    upload(f, fields);
+  });
+  $("import-cancel").addEventListener("click", () => { $("import-opts").hidden = true; pendingImport = null; });
+  async function upload(file, fields) {
     busy(`Opening ${file.name}…`);
     try {
       const fd = new FormData();
       fd.append("file", file, file.name);
+      for (const [k, v] of Object.entries(fields || {})) fd.append(k, v);
       const summary = await api("/api/editor/sessions", { method: "POST", body: fd });
       busy("");
       await openSummary(summary, true);
@@ -675,19 +1117,21 @@
   }
   async function closeDrawing() {
     const id = sid();
-    S.session = null; S.scene = null; S.proposal = null; S.overlay = null; activeCard = null; S.selected.clear();
+    disconnectEvents();
+    S.session = null; S.scene = null; S.proposal = null; S.overlay = null; activeCard = null; S.selected.clear(); S.area = null; S.pins = [];
     store("ed-session", null);
+    setComposer(false);
+    show("empty");
     $("suggest").replaceChildren();
     log.replaceChildren(el("div", "msg sys", "Open a drawing to start. Then describe a change, or click things on the drawing to select them."));
     updateSelection();
-    setComposer(false);
-    show("empty");
+    hooks.close.forEach((fn) => fn());
     if (id) api(`/api/editor/sessions/${id}`, { method: "DELETE" }).catch(() => {});
   }
 
   // ── undo / redo / changes ──────────────────────────────────────────────
   async function history(kind) {
-    if (!S.session || S.pending) return;
+    if (!S.session || S.pending || S.readOnly) return;
     setPending(true);
     try {
       if (activeCard) retire(activeCard, "Dropped (the drawing changed)", "no");
@@ -699,7 +1143,7 @@
   $("undo-btn").addEventListener("click", () => history("undo"));
   $("redo-btn").addEventListener("click", () => history("redo"));
   document.addEventListener("keydown", (e) => {
-    if (!(e.ctrlKey || e.metaKey) || !S.session || /^(INPUT|TEXTAREA)$/.test(document.activeElement.tagName)) return;
+    if (!(e.ctrlKey || e.metaKey) || !S.session || /^(INPUT|TEXTAREA|SELECT)$/.test(document.activeElement.tagName)) return;
     const k = e.key.toLowerCase();
     if (k === "z" && !e.shiftKey) { e.preventDefault(); history("undo"); }
     else if (k === "y" || (k === "z" && e.shiftKey)) { e.preventDefault(); history("redo"); }
@@ -724,15 +1168,17 @@
     }
   }
 
-  // ── tabs, composer, split ──────────────────────────────────────────────
+  // ── tabs, composer, voice, split ───────────────────────────────────────
   function selectTab(which) {
-    for (const [tab, pane] of [["tab-chat", "pane-chat"], ["tab-log", "pane-log"]]) {
-      const on = (which === "chat") === (tab === "tab-chat");
+    for (const [tab, pane] of [["tab-chat", "pane-chat"], ["tab-tools", "pane-tools"], ["tab-log", "pane-log"]]) {
+      const on = tab === "tab-" + which;
       $(tab).setAttribute("aria-selected", String(on));
       $(pane).hidden = !on;
     }
+    hooks.event.forEach((fn) => fn("tab", which));
   }
   $("tab-chat").addEventListener("click", () => selectTab("chat"));
+  $("tab-tools").addEventListener("click", () => selectTab("tools"));
   $("tab-log").addEventListener("click", () => selectTab("log"));
 
   $("compose").addEventListener("submit", (e) => {
@@ -748,21 +1194,46 @@
   $("input").addEventListener("input", () => {
     const t = $("input");
     t.style.height = "auto";
-    t.style.height = Math.min(t.scrollHeight, 140) + "px";
+    t.style.height = Math.min(t.scrollHeight, 160) + "px";
   });
   $("selchip-clear").addEventListener("click", () => setSelection([], false));
+
+  (function voice() {
+    const Rec = window.SpeechRecognition || window.webkitSpeechRecognition;
+    if (!Rec) return;
+    const mic = $("mic-btn");
+    mic.hidden = false;
+    let rec = null;
+    mic.addEventListener("click", () => {
+      if (rec) { rec.stop(); return; }
+      rec = new Rec();
+      rec.lang = navigator.language || "en-GB";
+      rec.interimResults = true;
+      const before = $("input").value;
+      rec.onresult = (ev) => {
+        let text = "";
+        for (const r of ev.results) text += r[0].transcript;
+        $("input").value = (before ? before + " " : "") + text;
+      };
+      rec.onerror = (ev) => { toast(ev.error === "not-allowed" ? "Microphone access was refused." : "Voice input stopped."); };
+      rec.onend = () => { rec = null; mic.setAttribute("aria-pressed", "false"); mic.classList.remove("rec"); $("input").focus(); };
+      mic.setAttribute("aria-pressed", "true");
+      mic.classList.add("rec");
+      rec.start();
+    });
+  })();
 
   function updateAiPill() {
     const ai = S.config && S.config.ai;
     const pill = $("ai-pill");
     if (ai && ai.enabled) {
-      const tail = String(ai.model || "on").split("/").pop();
+      const tail = String(ai.model || "on").split("/").pop().replace(/:free$/, "");
       pill.textContent = /nemotron/i.test(tail) ? "AI · Nemotron" : "AI · " + tail;
       pill.title = `Open-ended requests go to ${ai.provider || "an AI service"} (${ai.model}). Built-in commands stay on this server.`;
       pill.classList.add("on");
     } else {
       pill.textContent = "Built-in commands";
-      pill.title = "The AI assistant isn't connected on this server (set NVIDIA_API_KEY). Plain commands still work.";
+      pill.title = "The AI assistant isn't connected on this server (set OPENROUTER_API_KEY). Plain commands still work.";
       pill.classList.remove("on");
     }
   }
@@ -770,7 +1241,7 @@
   (function split() {
     const bar = $("split");
     const root = document.documentElement;
-    const clamp = (v) => Math.max(320, Math.min(v, Math.min(760, window.innerWidth * 0.7)));
+    const clamp = (v) => Math.max(320, Math.min(v, Math.min(820, window.innerWidth * 0.7)));
     const set = (v) => { root.style.setProperty("--chat-w", clamp(v) + "px"); resize(); };
     try { const saved = Number(localStorage.getItem("ed-chat-w")); if (saved) root.style.setProperty("--chat-w", clamp(saved) + "px"); } catch (e) { /* optional */ }
     bar.addEventListener("pointerdown", (e) => {
@@ -793,9 +1264,118 @@
     });
   })();
 
-  // ── export ─────────────────────────────────────────────────────────────
+  // ── live: other people in the same session ─────────────────────────────
+  let evAbort = null;
+  let evRetry = 0;
+  let lastPresence = 0;
+  let presenceTimer = 0;
+  function sendPresence() {
+    if (!sid() || S.people.length < 2 || S.readOnly) return;
+    const now = Date.now();
+    if (now - lastPresence < 120) {
+      clearTimeout(presenceTimer);
+      presenceTimer = setTimeout(sendPresence, 130);
+      return;
+    }
+    lastPresence = now;
+    const m = S.mouse || {};
+    fetch(`${API}/api/editor/sessions/${sid()}/presence`, {
+      method: "POST", headers: headers({ "Content-Type": "application/json" }),
+      body: JSON.stringify({ client: CLIENT, name: myName() || "Guest", x: m.x, y: m.y, selection: [...S.selected].slice(0, 200) }),
+    }).catch(() => {});
+  }
+  function renderPeople() {
+    const box = $("people");
+    box.replaceChildren();
+    const others = S.people.filter((p) => p.client !== CLIENT);
+    for (const p of others.slice(0, 6)) {
+      const a = el("span", "ed-avatar", (p.name || "G").slice(0, 1).toUpperCase());
+      a.style.background = p.color;
+      a.title = `${p.name || "Guest"} is here`;
+      box.append(a);
+    }
+    if (others.length) box.append(el("span", "muted small", others.length === 1 ? "1 other here" : `${others.length} others here`));
+  }
+  function disconnectEvents() {
+    if (evAbort) { evAbort.abort(); evAbort = null; }
+    S.people = []; S.cursors = {};
+    renderPeople();
+  }
+  async function connectEvents() {
+    disconnectEvents();
+    if (!sid() || typeof AbortController === "undefined") return;
+    const ac = new AbortController();
+    evAbort = ac;
+    const id = sid();
+    try {
+      const res = await fetch(`${API}/api/editor/sessions/${id}/events?client=${CLIENT}&name=${encodeURIComponent(myName() || "Guest")}`, { headers: headers(), signal: ac.signal });
+      if (!res.ok || !res.body) return;
+      evRetry = 0;
+      const reader = res.body.getReader();
+      const dec = new TextDecoder();
+      let buf = "";
+      for (;;) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buf += dec.decode(value, { stream: true });
+        let idx;
+        while ((idx = buf.indexOf("\n\n")) >= 0) {
+          const block = buf.slice(0, idx);
+          buf = buf.slice(idx + 2);
+          let kind = null, data = null;
+          for (const line of block.split("\n")) {
+            if (line.startsWith("event:")) kind = line.slice(6).trim();
+            else if (line.startsWith("data:")) { try { data = JSON.parse(line.slice(5)); } catch (e) { data = null; } }
+          }
+          if (kind) onLiveEvent(kind, data || {});
+        }
+      }
+    } catch (e) {
+      if (ac.signal.aborted) return;
+    }
+    if (evAbort === ac && sid() === id) { // dropped: reconnect with backoff
+      evRetry = Math.min(evRetry + 1, 6);
+      setTimeout(() => { if (evAbort === ac && sid() === id) connectEvents(); }, 1000 * 2 ** evRetry);
+    }
+  }
+  function onLiveEvent(kind, d) {
+    const who = d.by || d.name || "Someone";
+    if (kind === "hello") { S.people = d.people || []; renderPeople(); }
+    else if (kind === "presence") {
+      if (d.left) { S.people = S.people.filter((p) => p.client !== d.client); delete S.cursors[d.client]; }
+      else if (d.joined) { S.people = S.people.filter((p) => p.client !== d.client).concat([d]); toast(`${d.name || "Someone"} joined.`); }
+      renderPeople();
+      requestDraw();
+    } else if (kind === "cursor") {
+      S.cursors[d.client] = { x: d.x, y: d.y, name: d.name, color: d.color, t: Date.now() };
+      if (!S.people.some((p) => p.client === d.client)) { S.people.push({ client: d.client, name: d.name, color: d.color }); renderPeople(); }
+      requestDraw();
+    } else if (kind === "chat") {
+      addMsg("user other", `${who}: ${d.message}`);
+      if (d.reply) addMsg("bot", d.reply, "Answer to " + who);
+      renderData(d.data);
+      if (d.proposal) showProposal(d.proposal, who);
+      if ($("pane-chat").hidden) toast(d.proposal ? `${who} proposed a change. It's in the Assistant tab.` : `${who} asked: ${String(d.message).slice(0, 80)}`);
+    } else if (kind === "proposal") {
+      if (d.proposal) showProposal(d.proposal, who);
+      if (d.proposal && $("pane-chat").hidden) toast(`${who} proposed a change. It's in the Assistant tab.`);
+    } else if (kind === "changed") {
+      const card = d.proposal && cards.get(d.proposal);
+      if (card) retire(card, `Applied by ${who}`, "ok");
+      else if (activeCard) retire(activeCard, `Dropped: ${who} changed the drawing`, "no");
+      addMsg("sys", `${who} ${d.what === "accepted" ? "applied" : d.what}: ${(d.summaries || [d.label || ""]).join("; ")}`);
+      refresh();
+    } else if (kind === "rejected") {
+      const card = cards.get(d.proposal);
+      if (card) retire(card, `Rejected by ${who}`, "no");
+    }
+    hooks.event.forEach((fn) => fn(kind, d));
+  }
+
+  // ── export dialog (older AutoCAD versions) ─────────────────────────────
   const dlg = $("export-dlg");
   let exportPoll = 0;
+  let exportJob = null;
   function chip(group, name, value, label, checked, disabled) {
     const l = el("label", "chip");
     const i = el("input");
@@ -830,6 +1410,7 @@
     $("export-go").disabled = true;
     $("export-bar").hidden = false;
     $("export-status").textContent = "Converting…";
+    const fail = (err) => { $("export-status").textContent = err.message; $("export-go").disabled = false; };
     try {
       let job = await post(`/api/editor/sessions/${sid()}/export`, { target, format });
       const tick = async () => {
@@ -838,52 +1419,53 @@
         $("export-fill").style.width = pct + "%";
         $("export-bar").setAttribute("aria-valuenow", String(pct));
         if (job.status === "done") {
+          exportJob = job;
           const c = job.result.counts || {};
           $("export-status").textContent = `Ready: ${job.result.outputName}` + (c.skipped ? ` · ${c.skipped} item${c.skipped === 1 ? "" : "s"} skipped (see the report)` : " · nothing skipped");
-          const dl = $("export-dl");
-          dl.href = API + job.result.downloadUrl; dl.hidden = false;
-          const rp = $("export-report");
-          rp.href = API + job.result.reportUrl; rp.hidden = false;
+          $("export-dl").hidden = false;
+          $("export-report").hidden = false;
           $("export-go").disabled = false;
         } else if (job.status === "failed" || job.status === "cancelled") {
-          $("export-status").textContent = (job.error && job.error.message) || "The conversion failed.";
-          $("export-go").disabled = false;
+          fail(new Error((job.error && job.error.message) || "The conversion failed."));
         } else exportPoll = setTimeout(() => tick().catch(fail), 500);
       };
-      const fail = (err) => { $("export-status").textContent = err.message; $("export-go").disabled = false; };
       await tick();
-    } catch (err) {
-      $("export-status").textContent = err.message;
-      $("export-go").disabled = false;
-    }
+    } catch (err) { fail(err); }
   }
   $("export-btn").addEventListener("click", openExport);
   $("export-go").addEventListener("click", runExport);
+  $("export-dl").addEventListener("click", () => exportJob && download(exportJob.result.downloadUrl, exportJob.result.outputName));
+  $("export-report").addEventListener("click", () => exportJob && download(exportJob.result.reportUrl, "report.txt"));
   $("export-close").addEventListener("click", () => { clearTimeout(exportPoll); dlg.close ? dlg.close() : dlg.removeAttribute("open"); });
   dlg.addEventListener("close", () => clearTimeout(exportPoll));
-  $("dl-btn").addEventListener("click", () => {
-    const a = document.createElement("a");
-    a.href = `${API}/api/editor/sessions/${sid()}/download.dxf`;
-    a.download = "";
-    document.body.append(a); a.click(); a.remove();
-  });
+  $("dl-btn").addEventListener("click", () => download(`/api/editor/sessions/${sid()}/download.dxf`, "drawing.dxf"));
   $("close-btn").addEventListener("click", closeDrawing);
 
   // ── open-file controls ─────────────────────────────────────────────────
   $("choose-btn").addEventListener("click", () => $("file-input").click());
   $("file-input").addEventListener("change", (e) => { openFile(e.target.files[0]); e.target.value = ""; });
   $("sample-btn").addEventListener("click", openSample);
-  const view = $("view");
-  for (const ev of ["dragenter", "dragover"]) view.addEventListener(ev, (e) => { e.preventDefault(); $("drop").classList.add("is-over"); });
-  for (const ev of ["dragleave", "drop"]) view.addEventListener(ev, (e) => { e.preventDefault(); $("drop").classList.remove("is-over"); });
-  view.addEventListener("drop", (e) => { const f = e.dataTransfer && e.dataTransfer.files[0]; if (f) openFile(f); });
+  const viewPane = $("view");
+  for (const ev of ["dragenter", "dragover"]) viewPane.addEventListener(ev, (e) => { if (S.readOnly) return; e.preventDefault(); $("drop").classList.add("is-over"); });
+  for (const ev of ["dragleave", "drop"]) viewPane.addEventListener(ev, (e) => { e.preventDefault(); $("drop").classList.remove("is-over"); });
+  viewPane.addEventListener("drop", (e) => { if (S.readOnly || S.session) return; const f = e.dataTransfer && e.dataTransfer.files[0]; if (f) openFile(f); });
+
+  // ── public interface for editor-tools.js and editor-review.js ─────────
+  window.ED = {
+    S, API, $, el, btn, fmt, api, post, download, headers, toast, hooks, CLIENT,
+    sid, myName, accessKey, workspaceKey, local, randomId,
+    prep, buildScene, setScene, requestDraw, fitTo, fitView, viewport, overlaps, inkFor,
+    setSelection, selectAndShow, setArea, addMsg, renderData, tableEl, healthEl, showProposal, showLegend, stageOps,
+    send, selectTab, refresh, adopt, openSummary, show, busy, renderSuggestions, renderPeople, connectEvents, disconnectEvents,
+    updateAiPill, resize, setComposer, unitShort,
+  };
 
   // ── start ──────────────────────────────────────────────────────────────
   new ResizeObserver(resize).observe(cv);
   window.addEventListener("resize", resize);
   setComposer(false);
   log.replaceChildren(el("div", "msg sys", "Open a drawing to start. Then describe a change, or click things on the drawing to select them."));
-  (async function init() {
+  async function init() {
     try { S.config = await api("/api/editor/config"); } catch (err) {
       S.config = { ai: { enabled: false }, targets: [], formats: [] };
       dropError("The editing server isn't reachable. The editor needs the Backdate.dwg server (see the README).");
@@ -891,11 +1473,27 @@
     }
     updateAiPill();
     $("privacy").textContent = S.config.ai.enabled
-      ? "Your drawing stays on this server. For open-ended requests, your message and a summary of the drawing (layers, counts, text labels) are sent to NVIDIA's AI service. Built-in commands never leave the server."
-      : "Your drawing stays on this server. The AI assistant isn't connected here, so built-in commands only (rename or purge layers, move, scale, replace text, and so on).";
+      ? `Your drawing stays on this server. For open-ended requests, your message and a summary of the drawing (layers, counts, text labels) are sent to ${S.config.ai.provider || "the AI service"}. Built-in commands never leave the server.`
+      : "Your drawing stays on this server. The AI assistant isn't connected here, so built-in commands only (rename or purge layers, move, scale, replace text, health check, take-off, and so on).";
+    if (params.get("share")) { if (window.EDReview) window.EDReview.start(params.get("share")); return; }
+    if (params.get("join")) {
+      busy("Joining…");
+      try {
+        const j = await api(`/api/editor/join/${encodeURIComponent(params.get("join"))}`);
+        if (!myName()) { const n = window.prompt("Your name (shown to the others editing):", ""); if (n) local("bd-name", n.slice(0, 40)); }
+        busy("");
+        history_replace();
+        await openSummary(await api(`/api/editor/sessions/${j.sessionId}`), false, true);
+      } catch (err) { busy(""); dropError(err.message); }
+      return;
+    }
     const saved = store("ed-session");
     if (saved) {
       try { await openSummary(await api(`/api/editor/sessions/${saved}`), false); } catch (e) { store("ed-session", null); }
     }
-  })();
+  }
+  function history_replace() {
+    try { window.history.replaceState(null, "", location.pathname); } catch (e) { /* cosmetic */ }
+  }
+  document.addEventListener("DOMContentLoaded", init);
 })();

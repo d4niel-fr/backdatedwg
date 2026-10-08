@@ -147,17 +147,22 @@ def _run(args, engines: Engines, tmp: Path) -> int:
         recipe = _recipe(args)
         files = [Path(args.file)] if args.cmd == "apply" else sorted(f for f in Path(args.folder).rglob("*") if f.suffix.lower() in batch.DRAWING_EXT)
         dest = Path(args.out)
-        dest.mkdir(parents=True, exist_ok=True)
+        # `apply one.dxf --out edited.dxf` names the file; otherwise --out is a folder
+        single = args.cmd == "apply" and dest.suffix.lower() in batch.DRAWING_EXT
+        (dest.parent if single else dest).mkdir(parents=True, exist_ok=True)
         results = []
         for i, f in enumerate(files):
             work = tmp / str(i)
             r = batch.process_file(f, recipe, engines, work, dry_run=args.dry_run)
             if r.get("output"):
-                shutil.copyfile(work / "out" / r["output"], dest / r["output"])
+                shutil.copyfile(work / "out" / r["output"], dest if single else dest / r["output"])
             results.append(r)
         report = batch.report_text(recipe, results, args.dry_run)
-        (dest / "report.txt").write_text(report, "utf-8")
+        if not single:
+            (dest / "report.txt").write_text(report, "utf-8")
         print(report, file=out)
+        if single and results and results[0].get("output"):
+            print(f"wrote {dest}", file=out)
         return 0 if all(r["status"] == "done" for r in results) else 1
 
     if args.cmd == "audit":

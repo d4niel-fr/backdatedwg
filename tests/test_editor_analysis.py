@@ -91,7 +91,7 @@ def test_health_fixes_go_through_proposals(s):
 def test_fix_all_tolerates_fixes_that_find_nothing(s):
     # zero-length lines first, then duplicates: still valid even when one has nothing left to do
     prop = s.stage([{"op": "delete_duplicates", "optional": True}, {"op": "delete_duplicates", "optional": True}], [], "health")
-    assert any("Skipped delete_duplicates" in w for w in prop.warnings)
+    assert any("Skipped delete duplicates" in w for w in prop.warnings)
 
 
 def test_units_findings(tmp_path):

@@ -499,7 +499,7 @@ def warehouse(doc: Drawing, units: Units, min_aisle_m: float = 2.8) -> dict:
     msg = f"{bays:,} rack bays in {len(rows)} row{'s' if len(rows) != 1 else ''} running {'east–west' if horizontal else 'north–south'}"
     if aisles:
         widths = [a["widthMetres"] for a in aisles]
-        msg += f"; aisles {min(widths):g}–{max(widths):g} m wide"
+        msg += f"; aisles {min(widths):g} m wide" if min(widths) == max(widths) else f"; aisles {min(widths):g}–{max(widths):g} m wide"
     if narrow:
         msg += f". {len(narrow)} aisle{'s are' if len(narrow) != 1 else ' is'} narrower than {min_aisle_m:g} m"
     return {"found": True, "direction": "x" if horizontal else "y", "bays": bays, "rows": rows, "aisles": aisles,

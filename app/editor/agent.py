@@ -321,7 +321,7 @@ def local_answer(session: EditorSession, text: str, selection: list[str], area: 
 
 
 def local_plan(session: EditorSession, text: str) -> Optional[tuple[list, str, str]]:
-    """Multi-step built-ins: (steps, reply, why)."""
+    """Multi-step built-ins: (steps, reply, why). No steps means there's nothing to do; the reply says why."""
     t = _norm(text).lower().rstrip("?.! ")
     if re.fullmatch(r"(?:clean|tidy)\s*up(?:\s+(?:the|this)\s+(?:drawing|file|plan))?|(?:clean|tidy)\s+(?:the|this)\s+(?:drawing|file|plan)(?:\s+up)?|fix\s+(?:everything|all(?:\s+the)?\s+(?:issues|problems))", t):
         from .health import SAFE
@@ -330,13 +330,16 @@ def local_plan(session: EditorSession, text: str) -> Optional[tuple[list, str, s
         steps = [{"title": f["fix"]["label"] + " — " + f["title"].lower(), "ops": [{**o, "optional": True} for o in f["fix"]["ops"]]}
                  for f in h["findings"] if f["fix"] and f["id"] in SAFE | {"spelling"}][:8]
         if not steps:
-            return None
+            rest = [f["title"].lower() for f in h["findings"]]
+            return [], (f"Nothing to clean up: the health check scores {h['score']}/100"
+                        + (f", and what's left needs your judgement ({'; '.join(rest[:4])})." if rest else " with no findings.")), ""
         return steps, f"Here is a {len(steps)}-step clean-up. Untick any step you don't want, then accept.", "These are the health-check fixes that only remove clutter or correct obvious mistakes; riskier ones (stray objects, units) are left for you to decide."
     if re.fullmatch(r"(?:standardi[sz]e|normali[sz]e|fix|rename)\s+(?:the\s+)?layers?(?:\s+names?)?(?:\s+to\s+(?:the\s+)?(?:standard|ncs|aia))?|apply\s+(?:the\s+)?layer\s+standards?", t):
         with session.lock:
             p = standards.propose(session.doc)
         if not p["ops"]:
-            return None
+            return [], (f"No layer renames to suggest: {p['unmatched']} layer{'s' if p['unmatched'] != 1 else ''} didn't match a standard rule. Paste your own mapping under Tools → Check and clean."
+                        if p["unmatched"] else "Your layer names already follow the NCS/AIA standard."), ""
         listed = ", ".join(f"{r['from']} → {r['to']}" for r in p["rows"] if r["status"] == "rename")
         return [{"title": "Rename layers to the standard", "ops": p["ops"]}], f"Here are {p['renames']} layer renames to the NCS/AIA standard: {listed[:400]}." + (f" {p['unmatched']} layer{'s' if p['unmatched'] != 1 else ''} didn't match a rule and stay as they are." if p["unmatched"] else ""), "Layer names are matched to the US National CAD Standard by the words in them (wall, door, dim, text…)."
     if re.fullmatch(r"(?:check|fix)\s+(?:the\s+)?spelling|spell\s*check|correct\s+(?:the\s+)?spelling", t):
@@ -345,7 +348,7 @@ def local_plan(session: EditorSession, text: str) -> Optional[tuple[list, str, s
         with session.lock:
             typos = spelling(session.doc)
         if not typos:
-            return None
+            return [], "I found none of the common misspellings in this drawing's text. For a full proofread, ask the AI assistant to proofread the text.", ""
         ops_ = [{"op": "replace_text", "find": w, "replace": r, "match_case_of_found": True, "optional": True} for w, (r, _n, _h) in sorted(typos.items())[:12]]
         return [{"title": "Correct spelling", "ops": ops_}], "Here are the spelling corrections I found: " + ", ".join(f"{w} → {r}" for w, (r, _n, _h) in sorted(typos.items())[:10]) + ".", "These words are on a list of common misspellings; for a full proofread, connect the AI assistant and ask it to proofread the text."
     return None
@@ -676,6 +679,8 @@ def run(session: EditorSession, message: str, selection: list[str], model: Optio
     plan = local_plan(session, message)
     if plan:
         steps, reply, why = plan
+        if not steps:
+            return _finish(session, Reply(reply, source="local"), selection)
         try:
             prop = session.stage([], selection, "local", message, steps=steps, why=why)
             return Reply(reply, prop.view(), "local")

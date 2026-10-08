@@ -799,6 +799,8 @@ def apply_recipe_here(sid: str, body: RecipeBody, request: Request):
     try:
         prop = s.stage([], [], "recipe", f"Recipe: {recipe['name']}", steps=steps[:8],
                        why="These are the recipe's steps; any that find nothing to do in this drawing are skipped.")
+    except ops.NothingToChange as e:
+        return {"proposal": None, "message": str(e), "truncated": False}
     except ops.OpError as e:
         return error(422, "bad_ops", str(e))
     return {"proposal": prop.view(), "truncated": len(steps) > 8}
